@@ -1,17 +1,22 @@
-'''App: slimmed application state (Plan Part 3's app.py).
+'''App: application state (Plan Part 3's app.py).
 
-Delegates all playback mechanics — including elapsed-time tracking, which the old
-MidiVis's App owned directly via pygame.time.get_ticks() — to an AudioEngine
-implementation (Plan Part 3.1). App itself only knows "what file is loaded" and
-"what does the tempo map say the total duration is"; play/pause/seek/elapsed all
-forward straight to the engine.
+Milestone 2 kept this deliberately minimal ("load a file, play/pause/seek").
+Milestone 3 grows it to match: track list + per-track mute, active-note
+tracking for the bars view, and the metadata (bpm/time_sig/key_sig/
+instruments) the properties panel needs — i.e. "feature parity with today's
+app apart from traditional notation" per Plan Part 4, minus recording/MIDI
+input (Milestone 5) and the notation engine (Milestone 4).
 
-Track list/mute UI, the notation views, and MIDI input/recording are later
-milestones (Plan Part 4: Milestone 3 onward) — this is deliberately just
-"load a file, play/pause/seek", matching Milestone 2's "basic playback wired to a
-minimal shell UI" scope. It doesn't build midi.model.Timeline yet either: the
-FluidPlayerBackend plays raw file bytes directly (like the old engine.load_from_mem()
-path), so nothing here needs populated note events.
+Playback mechanics (play/pause/seek/elapsed) still forward straight to the
+injected AudioEngine, which owns the clock (Milestone 2's design). The one
+addition there is `seek_preview()`: a visual-only position used while the
+timeline is being dragged. The old App could just overwrite its own
+wall-clock `elapsed` field for this; here `elapsed` is a property that reads
+the engine, so there's no local field to freely overwrite. Instead
+`_preview_elapsed`, when set, shadows the engine's clock for display and for
+active-note computation without calling into the engine at all — only
+`seek()` (drag release / click-to-seek) actually commits a position to the
+engine and clears it.
 '''
 from __future__ import annotations
 
@@ -20,7 +25,10 @@ import os
 import mido
 
 from midivis.audio.engine import AudioEngine, PlayerStatus
-from midivis.midi.model import TempoMap
+from midivis.midi import analyze
+from midivis.midi import channel_remap
+from midivis.midi import load as midi_load
+from midivis.midi.model import TempoMap, Timeline
 
 
 class App:
@@ -29,7 +37,39 @@ class App:
         self.midi_path: str | None = None
         self.title: str = ''
         self.tempo_map: TempoMap | None = None
+        self.timeline: Timeline | None = None
         self.total_dur: float = 0.0
+
+        self.bpm: float = 120.0
+        self.time_sig: tuple[int, int] = (4, 4)
+        self.key_sig: str | None = None
+        self.measure_times: list[tuple[int, float]] = []
+
+        self.tracks: dict[int, str] = {}
+        self.enabled_tracks: set[int] = set()
+        self.track_channels: dict[int, set[int]] = {}
+        self.instruments: dict[int, list[int]] = {}
+
+        # (start_s, end_s, note, velocity, track_id) tuples — _all_note_events
+        # is every note in the file; note_events is filtered to enabled_tracks
+        # (what the bars view actually draws).
+        self._all_note_events: list[tuple[float, float, int, int, int]] = []
+        self.note_events: list[tuple[float, float, int, int, int]] = []
+        # Flattened (time_s, kind, note, track_id) on/off events, sorted, used
+        # to track active_notes incrementally during playback and by full
+        # rebuild on seek — same two-mode approach as the old App.
+        self._flat_events: list[tuple[float, int, int, int]] = []
+        self._event_index = 0
+        self.active_notes: set[int] = set()
+
+        self._preview_elapsed: float | None = None
+
+        self.kb_notes: set[int] = set()
+        self._kb_channel = 0
+
+        self.sheet_zoom: float = 1.0
+        self.bars_scroll: float = 0.0
+        self.properties_expanded: bool = False
 
     @property
     def loaded(self) -> bool:
@@ -47,11 +87,46 @@ class App:
         self.tempo_map = TempoMap.from_midi(mid)
         self.total_dur = mid.length
 
+        self.timeline = midi_load.load_timeline(mid, self.tempo_map)
+        self._all_note_events = [
+            (self.tempo_map.ticks_to_seconds(ne.start_tick),
+             self.tempo_map.ticks_to_seconds(ne.end_tick),
+             ne.note, ne.velocity, ne.track_id)
+            for ne in self.timeline.note_events
+        ]
+        self._flat_events = sorted(
+            [(s, 0, note, tid) for (s, e, note, vel, tid) in self._all_note_events]
+            + [(e, 1, note, tid) for (s, e, note, vel, tid) in self._all_note_events],
+            key=lambda ev: (ev[0], ev[1]))
+
+        self.tracks = midi_load.get_track_names(mid)
+        self.track_channels = midi_load.get_track_channels(mid)
+        self.instruments = midi_load.get_instruments(mid)
+        self.enabled_tracks = set(self.tracks.keys())
+        self.note_events = list(self._all_note_events)
+
+        self.bpm = analyze.get_tempo(mid)
+        self.time_sig = analyze.get_time_signature(mid)
+        self.key_sig = analyze.get_key_signature(mid) or analyze.detect_key_signature(mid)
+        self.measure_times = midi_load.build_measure_times(
+            self.bpm, self.time_sig[0], self.total_dur)
+
+        self._preview_elapsed = None
+        self._reset_playback()
+        self.kb_notes = set()
+
+        mid_bytes, ch_remap = channel_remap.remap_channels(mid)
+        for tid, new_ch in ch_remap.items():
+            self.track_channels[tid] = {new_ch}
+
         if self.engine:
-            with open(path, 'rb') as f:
-                midi_bytes = f.read()
-            self.engine.load(midi_bytes, self.tempo_map)
+            self.engine.load(mid_bytes, self.tempo_map)
+            self._update_track_muting()
         return True
+
+    # ------------------------------------------------------------------
+    # Playback
+    # ------------------------------------------------------------------
 
     @property
     def playing(self) -> bool:
@@ -59,6 +134,8 @@ class App:
 
     @property
     def elapsed(self) -> float:
+        if self._preview_elapsed is not None:
+            return self._preview_elapsed
         if not self.engine:
             return 0.0
         return self.engine.get_clock_seconds()
@@ -66,6 +143,12 @@ class App:
     def play(self) -> None:
         if not self.loaded or not self.engine:
             return
+        self._preview_elapsed = None
+        if self.elapsed >= self.total_dur:
+            self.engine.stop()
+            self._reset_playback()
+        self._sync_event_index()
+        self._rebuild_active_notes()
         self.engine.play()
 
     def pause(self) -> None:
@@ -74,19 +157,114 @@ class App:
         self.engine.pause()
 
     def seek(self, seconds: float) -> None:
+        self._preview_elapsed = None
         if not self.engine:
             return
         self.engine.seek(max(0.0, min(seconds, self.total_dur)))
+        self._sync_event_index()
+        self._rebuild_active_notes()
+
+    def seek_preview(self, seconds: float) -> None:
+        '''Visual-only position update — used during timeline drag, without
+        calling into the engine (see the module docstring).
+        '''
+        self._preview_elapsed = max(0.0, min(seconds, self.total_dur))
+        self._sync_event_index()
+        self._rebuild_active_notes()
 
     def update(self) -> None:
-        '''Poll for song-end and reset to a stopped state at position 0.
-
-        Checks get_status() directly rather than gating on self.playing — playing
-        is already False once status flips to DONE (it's defined as status ==
-        PLAYING), so gating on it would make this never fire.
+        '''Poll for song-end, and otherwise advance active_notes forward to
+        match elapsed. Checks get_status() directly rather than gating on
+        self.playing — see Milestone 2's Status notes on why that gate is
+        wrong (playing is already False the instant status flips to DONE).
         '''
         if self.engine and self.engine.get_status() == PlayerStatus.DONE:
             self.engine.stop()
+            self._reset_playback()
+            return
+        if self._preview_elapsed is not None:
+            return   # frozen at the drag-preview position; nothing to advance
+        elapsed = self.elapsed
+        while (self._event_index < len(self._flat_events)
+               and self._flat_events[self._event_index][0] <= elapsed):
+            _, kind, note, track_id = self._flat_events[self._event_index]
+            if track_id in self.enabled_tracks:
+                if kind == 0:
+                    self.active_notes.add(note)
+                else:
+                    self.active_notes.discard(note)
+            self._event_index += 1
+
+    def _reset_playback(self) -> None:
+        self._event_index = 0
+        self.active_notes = set()
+
+    def _sync_event_index(self) -> None:
+        '''Recompute _event_index to match the current elapsed after a
+        discontinuous jump (seek/seek_preview) rather than incrementing.
+        '''
+        self._event_index = 0
+        while (self._event_index < len(self._flat_events)
+               and self._flat_events[self._event_index][0] <= self.elapsed):
+            self._event_index += 1
+
+    def _rebuild_active_notes(self) -> None:
+        self.active_notes = set()
+        for t, kind, note, track_id in self._flat_events:
+            if t > self.elapsed:
+                break
+            if track_id not in self.enabled_tracks:
+                continue
+            if kind == 0:
+                self.active_notes.add(note)
+            else:
+                self.active_notes.discard(note)
+
+    # ------------------------------------------------------------------
+    # Track list / mute
+    # ------------------------------------------------------------------
+
+    def set_all_tracks(self, enabled: bool) -> None:
+        self.enabled_tracks = set(self.tracks.keys()) if enabled else set()
+        self._rebuild_filtered()
+
+    def toggle_track(self, track_id: int) -> None:
+        if track_id in self.enabled_tracks:
+            self.enabled_tracks.discard(track_id)
+        else:
+            self.enabled_tracks.add(track_id)
+        self._rebuild_filtered()
+
+    def _rebuild_filtered(self) -> None:
+        self.note_events = [e for e in self._all_note_events if e[4] in self.enabled_tracks]
+        self._rebuild_active_notes()
+        self._update_track_muting()
+
+    def _update_track_muting(self) -> None:
+        if not self.engine:
+            return
+        for channels in self.track_channels.values():
+            for ch in channels:
+                ch_on = any(ch in self.track_channels.get(t, set()) for t in self.enabled_tracks)
+                self.engine.set_channel_muted(ch, not ch_on)
+
+    # ------------------------------------------------------------------
+    # On-screen keyboard passthrough
+    # ------------------------------------------------------------------
+
+    def kb_note_on(self, note: int) -> None:
+        if self.engine:
+            self.engine.note_on(self._kb_channel, note, 100)
+        self.kb_notes.add(note)
+
+    def kb_note_off(self, note: int) -> None:
+        if self.engine:
+            self.engine.note_off(self._kb_channel, note)
+        self.kb_notes.discard(note)
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     def shutdown(self) -> None:
         if self.engine:

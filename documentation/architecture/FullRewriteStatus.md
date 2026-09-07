@@ -4,7 +4,110 @@ Repo: C:\Users\crste\git\MidiVis2
 Plan: documentation/architecture/FullRewritePlan.md
 
 ## Current milestone
-3 — UI shell + widgets + slots (not started)
+3 — UI shell + widgets + slots (done, plus three post-milestone bugfixes below;
+awaiting your test/commit)
+
+## Post-Milestone-3 bugfixes (reported by user, fixed same session as reported)
+
+### Bugfix 1: releasing Shift didn't release notes latched via the on-screen keyboard's sustain-pedal modifier
+**Symptom**: on the on-screen keyboard (`KeyboardSlot`), holding Shift and clicking a
+key latches it (per Plan Part 1's "Shift = latch/sustain toggle"), but releasing the
+Shift key did nothing — the note kept sounding until you clicked it again. User's own
+framing ("the shift key is the sustain pedal key") makes clear the expected semantics:
+releasing the pedal should release whatever it's holding, like a real sustain pedal,
+not require a second deliberate click per note.
+
+**Root cause**: `KeyboardSlot.handle_event()` (ported near-verbatim from the old repo's
+`ui/slots/keyboard.py`) only ever read the Shift modifier live, inside mouse-event
+branches, to decide whether a click toggles a note into `app.kb_notes` versus playing
+it normally. Nothing in the method — old or new — ever handled `pygame.KEYUP`, so
+releasing Shift was simply invisible to it; a latched note stayed in `app.kb_notes`
+(and therefore audible, since `AudioEngine.note_on`/`note_off` calls are the only thing
+gating the actual sound) indefinitely.
+
+**Fix**: `KeyboardSlot.handle_event()` now handles `pygame.KEYUP` for
+`K_LSHIFT`/`K_RSHIFT` explicitly: it calls `app.kb_note_off()` for every note
+currently in `app.kb_notes` (a snapshot copy, since `kb_note_off` mutates that set)
+and returns `False` (doesn't consume the event — nothing else in this milestone's UI
+cares about Shift release). This clears *all* currently-held on-screen-keyboard notes
+on pedal release, not just ones latched via Shift-click — matches real sustain-pedal
+behavior, and the only other way a note ends up in `kb_notes` is an in-progress plain
+click-drag, where cutting it off on an incidental Shift release mid-drag is a rare,
+harmless edge case (the drag's own `MOUSEBUTTONUP` handler still runs afterward and
+just no-ops on a note that's already off).
+
+**Regression test added**: `tests/test_keyboard_slot.py` (new file) — drives
+`KeyboardSlot` directly against a minimal fake `App` (just `kb_notes`/`kb_note_on`/
+`kb_note_off`), faking `pygame.key.get_mods()` for the duration of a simulated click so
+the test doesn't depend on real OS key state. Covers: a Shift-click latches a note past
+mouse-up (confirms the *original*, still-intended latch behavior wasn't broken by the
+fix); Shift KEYUP releases every currently-latched note; Shift KEYUP with nothing
+latched is a no-op that doesn't consume the event. 3 new tests.
+`python -m unittest discover -s tests -v` — 61/61 passing (58 from Milestone 3 + 3 new).
+
+### Bugfix 2: dashboard title text overlapping the "New File" button
+**Symptom** (reported with a screenshot): the "MIDI VIS" title label at the top of the
+left dashboard panel visibly overlapped the "New File" button directly below it.
+
+**Root cause**: `render/dashboard.py`'s title-and-button y-offsets (`title` at `pt + 6`,
+`btn_new` at `y0 + 16`) were ported directly from the old repo's identical constants.
+Measuring the actual rendered height of the `small` font's "MIDI VIS" text on this
+machine (`pygame.font.SysFont('segoeui', 11)`, 15px tall including line spacing) showed
+the title's bottom edge landing at y=45 while the button's top edge started at y=40 — a
+real 5px overlap, not a rounding artifact. (The old repo carried the same numbers; either
+it had the same latent overlap and nobody happened to look closely, or font metrics
+differ enough across machines/font-fallback that it didn't show up there. Either way,
+±5px of margin is too fragile to rely on.) This was never caught in this session's own
+Milestone 3 testing because none of the smoke tests actually *looked* at the rendered
+window — they checked for crashes and simulated event outcomes, not visual layout.
+
+**Fix**: shifted every dashboard button (and both chrome separator lines) down by a
+uniform 14px in `render/dashboard.py` — preserves every *relative* gap between buttons/
+separators (verified by re-checking each pair's spacing arithmetic against the old
+values), just adds real clearance below the title. Re-measured after the fix: title
+bottom at y=45, first button top now at y=54 — a 9px clear gap.
+
+**Verification**: rendered the dashboard to an actual `pygame.Surface` (headless,
+`SDL_VIDEODRIVER=dummy`) and saved it as a PNG to visually confirm the fix, rather than
+trusting the arithmetic alone — no automated test covers pixel-level layout like this,
+and none was added (a numeric layout assertion would be brittle against font/theme
+changes; this is the kind of thing a screenshot check is actually right for). Not
+checked into `tests/`.
+
+### Bugfix 3: reset button's icon rendered as a malformed blob instead of an arrowhead
+**Symptom** (reported with a zoomed screenshot): the dashboard's circular-arrow "reset"
+icon showed a garbled flag/hook shape instead of a clean triangular arrowhead.
+
+**Root cause**: `_icon_reset()` in `render/dashboard.py` (ported verbatim from the old
+repo) computes the arrowhead as a triangle: a tip extended along the arc's tangent
+direction at its start point, plus two base points offset perpendicular to that tangent.
+The perpendicular vector was computed wrong — `perp_x = -tang_y` was correct, but the two
+base points' y-coordinates were computed inline as `ty + w * (-tang_x)` and
+`ty - w * (-tang_x)` instead of using the corresponding `perp_y = tang_x`. Concretely, for
+the icon's actual tangent (`tang = (-0.866, -0.5)` at the arc's 60° start angle), the code
+used offset vector `(0.5, 0.866)`, but the true perpendicular is `(0.5, -0.866)` — the
+y-component's sign was flipped. A dot product confirms `(0.5, 0.866) · (-0.866, -0.5) =
+-0.866 ≠ 0`, i.e. the "perpendicular" wasn't perpendicular at all, so the two base points
+weren't symmetric around the tangent point and the "triangle" came out skewed into a
+blob rather than a clean arrowhead. This is exactly the kind of small hand-derived-trig
+bug the Plan's Part 2 notes call out about the old repo's hand-drawn vector icons in
+general (there, about the notation renderer's rests; same underlying fragility here).
+
+**Fix**: rewrote the vector math cleanly — `perp_x, perp_y = -tang_y, tang_x` (a proper
+90° rotation of the tangent vector), then `tip`/`p1`/`p2` all built from named, correctly
+signed vectors instead of inline sign-flipped expressions. No behavior change intended
+beyond fixing the shape — same arc, same triangle size/position, just geometrically
+correct now.
+
+**Verification**: rendered the button in isolation to a PNG (zoomed 8x, headless) before
+and after the fix to visually confirm — this is a pure-rendering bug with no meaningful
+non-visual assertion to unit test (the "correct" output is "looks like an arrowhead",
+which a screenshot check is the right tool for, not a pixel-coordinate assertion that
+would just re-encode the same fixed math it's supposed to verify). Not checked into
+`tests/`.
+
+`python -m unittest discover -s tests -v` — still 61/61 passing after Bugfixes 2-3
+(neither touched any code with existing test coverage).
 
 ## Post-Milestone-2 bugfixes (reported by user, fixed same session as reported)
 
@@ -118,7 +221,127 @@ despite exercising the real retry loop. 3 new tests.
 `python -m unittest discover -s tests -v` — 25/25 passing (22 from Bugfix 1 + 3 new).
 
 ## Completed milestones
-2 — Audio engine v1. Done this session:
+3 — UI shell + widgets + slots. Done this session:
+- `midivis/render/theme.py` (new) — one consolidated `THEMES` dict (dark/light) covering
+  every UI surface: shared slot infra (handle/scrollbar), dashboard chrome, menu bar, and
+  — new relative to the old repo — the **track dropdown**, which the old
+  `ui/dashboard.py` hardcoded in literal colors and which Light theme silently did nothing
+  for (Plan Part 2's called-out bug). Replaces the old repo's two-dict `SLOT_THEMES`/
+  `UI_THEMES` split.
+- `midivis/render/widgets/` (new package) — the five widgets Plan Part 3.4 names:
+  - `button.py` — `Button`, ported from the copy that used to live inline in
+    `ui/dashboard.py`.
+  - `menu.py` — `MenuItem`/`TopMenu`/`Dropdown`/`MenuBar`. `Dropdown` is the one
+    parameterized hit-test/draw component the old `ui/menu_bar.py`'s six duplicated
+    blocks (File dropdown, its Recent submenu, View dropdown, its Theme submenu, its
+    Slots submenu, Keyboard dropdown) collapse onto; `MenuBar` composes two `Dropdown`s
+    (top-level + one submenu level, matching the old system's actual max nesting depth)
+    and drives them from a per-top-menu `items_fn() -> list[MenuItem]` callable so
+    content can reflect live state (recent files, theme/slot checkmarks) without the
+    widget knowing what any of that state means.
+  - `scrollbar.py` — `VerticalScrollbar`, the one shared drag-thumb implementation now
+    used by both the bars view's roll scrollbar and (structurally ready for) anything
+    else that needs one — the old repo had bars_sheet.py's version as the only real
+    implementation.
+  - `mini_keyboard.py` — shared `is_black`/`white_index` note-geometry helpers, used by
+    both `KeyboardSlot` (interactive) and `BarsSlot`'s piano strip (display-only) instead
+    of each independently reimplementing the same math. Deliberately *not* a single
+    widget that also owns drawing — see the module's docstring for why forcing one
+    draw() over both would be the wrong abstraction.
+  - `text_input.py` — `TextInput`, extracted from the old record-arm panel's hand-rolled
+    cursor/insert/delete/click-to-position code. **Not wired into anything this
+    milestone** — the record-arm panel it came from is Milestone 5 (recording) — built
+    now, as its own tested unit, so M5 can consume it directly. See Deviations.
+- `midivis/render/fonts.py` (new) — lazy font cache, ported from the old `ui/fonts.py`
+  (`get_fonts()`, `symbol_font()` for the menu's ► / ✓ glyphs). Dropped
+  `measure_trad`/`normal_bold` (traditional-notation-only, Milestone 4).
+- `midivis/render/slots/` (new files: `slot_base.py`, `slot_manager.py`, `timeline.py`,
+  `bars.py`, `keyboard.py`, `properties.py`) — the view stack. `slot_manager.py` fixes
+  both bugs Plan Part 2/3.4 call out by name in the old `ui/slot_manager.py`, made while
+  rebuilding it rather than patched after — see that file's module docstring for the
+  exact mechanism of each fix, and `tests/test_slot_manager.py` for the regression tests:
+  - **Single-flex-slot limitation**: `rects()` now splits leftover height evenly across
+    however many `fixed_height=None` slots are visible (remainder pixels go to the last
+    one), instead of giving 100% of the leftover to any one of them.
+  - **Click-priority-vs-visual-order mismatch**: `handle_event()` now dispatches
+    non-timeline slots in `self._order` (the same list drag-to-reorder mutates) instead
+    of a hardcoded `('sheet', 'keyboard', 'properties')` tuple.
+  - Also fixed the O(n) `render()` calling `rects()` once per slot instead of once per
+    frame (Plan Part 2's "rects() is redundantly recomputed" note).
+  - `bars.py` (renamed from `bars_sheet.py`/`BarsSheetSlot` → `BarsSlot`, keeping the
+    `'sheet'` slot id) drops the live-recording note overlay (Milestone 5) and now sits
+    on `VerticalScrollbar`/`mini_keyboard` instead of locally-duplicated copies.
+  - `properties.py` drops the recording-state indicator and the MIDI-input-device column
+    — both Milestone 5 concerns (`recorder`/`midi_input` don't exist in `App` yet).
+  - No `sheet_slot.py` dispatcher this milestone — traditional notation doesn't exist
+    yet, so `BarsSlot` is registered directly as the `'sheet'` slot; Milestone 4 adds the
+    bars/traditional dispatch layer when there's a second view to dispatch to.
+- `midivis/render/dashboard.py` (new) — left panel: New/Open file, Play/Pause, Reset,
+  Tracks dropdown (per-track mute + Select All/None). Ported from the old
+  `ui/dashboard.py` minus the record-arm panel (Milestone 5) and the Bars/Traditional
+  view toggle (Milestone 4 — only one view exists so far) — see Deviations for why this
+  trims the old 1145-line file down substantially rather than porting it whole.
+- `midivis/midi/instruments.py` (new) — GM instrument/drum-kit/drum-note name tables,
+  ported verbatim from the old repo's `midi_instruments.py`. Needed by the properties
+  panel's instrument list.
+- `midivis/midi/analyze.py` (new) — `get_tempo`/`get_time_signature`/`get_key_signature`/
+  `detect_key_signature`, ported from the old repo's `midi_analyzer.py` (minus its
+  instrument-table re-exports, which now live in `instruments.py` directly).
+- `midivis/midi/channel_remap.py` (new) — `remap_channels()`, ported from the old
+  `midi_processing.py`. This is the **basic** remap Milestone 3 needs for per-track mute
+  to be channel-accurate; the two known gaps (>15 simultaneous melodic tracks, multiple
+  simultaneous drum tracks) are explicitly still Milestone 5's "channel-remap edge-case
+  fixes" — see Deviations for how this resolves the ambiguity the previous session's
+  notes flagged.
+- `midivis/midi/load.py` (new) — `load_timeline()` (SMF → `Timeline`, replacing the old
+  `midi_processing.build_timeline`/`build_note_events`) plus `get_track_names`/
+  `get_track_channels`/`get_instruments`/`build_measure_times`, folded into the same
+  module for the same reason the old repo kept them together (`midi_processing.py`): all
+  "read track/structural metadata out of an SMF" with no dedicated home in Plan Part 3's
+  tree. `load_timeline` builds `NoteEvent`s directly in **ticks** (no tempo map needed at
+  build time — a structural improvement over the old build_timeline, which pre-converted
+  to seconds during construction, matching how `midi/model.py`'s `NoteEvent` docstring
+  already said ticks should work).
+- `midivis/app.py` (grown, not rewritten) — `App` gains: `tracks`/`enabled_tracks`/
+  `track_channels`/`instruments` + `set_all_tracks()`/`toggle_track()`/
+  `_update_track_muting()` (per-track mute, calling `engine.set_channel_muted`);
+  `timeline`/`note_events`/`active_notes` + incremental/rebuild active-note tracking
+  (ported from the old App's `_sync_event_index`/`_rebuild_active_notes`/`update()` tail
+  loop, now over a precomputed `_flat_events` list instead of walking raw MIDI messages);
+  `bpm`/`time_sig`/`key_sig`/`measure_times`; `kb_notes`/`kb_note_on()`/`kb_note_off()`
+  (on-screen keyboard passthrough, bypassing the player exactly like the old app);
+  `sheet_zoom`/`bars_scroll`/`properties_expanded`; and `seek_preview()` for
+  drag-scrubbing. See Deviations for `seek_preview()`'s design — it had to be rethought,
+  not just ported, because Milestone 2 moved clock ownership into the engine.
+- `main.py` — replaced Milestone 2's throwaway 900x220 debug window wholesale (as that
+  milestone's own notes said to) with the real shell: `MenuBar` (File: New/Open/Recent;
+  View: Color Theme, Slots visibility), `Dashboard`, `SlotManager` with all four slots,
+  window resize handling, mouse-wheel sheet zoom/scroll/seek-nudge, Ctrl+O, Space,
+  Escape. Kept only Milestone 2's settings/audio-setup/engine-construction bootstrapping,
+  per that milestone's own "Notes for the next session."
+- `tests/test_channel_remap.py`, `tests/test_load.py`, `tests/test_text_input.py`,
+  `tests/test_slot_manager.py` (all new) — pure-function/pure-logic unit tests per the
+  Plan's Verification section ("introduce targeted unit tests as each new pure module
+  lands"), covering: channel collision/drum-pinning assignment; tick-domain note-event
+  construction including sustain-pedal extension and FIFO same-pitch pairing;
+  `TextInput`'s editing logic; and the two `SlotManager` bug fixes as explicit
+  regressions (a test that fails against the old hardcoded-tuple/single-flex-slot
+  behavior and passes against the fix).
+- `tests/test_app.py` (extended) — `_StubEngine` gained `set_channel_muted`/`note_on`/
+  `note_off`/`program_change`/`all_notes_off`/`cc` (no-ops recording calls) so it still
+  satisfies `App`'s now-larger `AudioEngine` usage; new tests cover track mute
+  (`toggle_track`/`set_all_tracks` calling `engine.set_channel_muted` correctly,
+  including the "still muted if another enabled track shares the channel" case),
+  keyboard passthrough, and `seek_preview()` vs `seek()` (preview never touches the
+  engine; `seek()` commits it and clears the preview).
+- `python -m unittest discover -s tests -v` — 58/58 passing for the milestone itself
+  (25 carried forward + 33 new — see Test results below for the exact breakdown);
+  61/61 after the post-milestone Shift-sustain bugfix's 3 additional tests
+  (`tests/test_keyboard_slot.py`, see Post-Milestone-3 bugfixes above).
+- Manually verified against real hardware (`python main.py` with the real FluidSynth
+  install already configured on this machine) — see Test results below.
+
+2 — Audio engine v1. Done a previous session:
 - `midivis/audio/engine.py` — `AudioEngine` Protocol (`PlayerStatus` enum: READY/
   PLAYING/STOPPING/DONE) per Plan Part 3.1. One deliberate signature deviation from
   the plan's pseudocode: `load(midi_bytes, tempo_map)` takes a `TempoMap` as well as
@@ -253,13 +476,12 @@ despite exercising the real retry loop. 3 new tests.
   them as-is rather than re-copying.
 
 ## In progress / partially done this session
-(none — Milestone 2 fully complete: `AudioEngine` interface, `FluidPlayerBackend` with
-the WASAPI-first driver fallback chain and `silent_play_seek` preserved, `app.py`
-rewritten to delegate to the engine, and the minimal shell UI in `main.py`, are all
-done and verified against real FluidSynth hardware. `midi/load.py`/`Timeline`
-population, track list/mute, `render/widgets`, `SlotManager`, and every other
-audio/render/notation/input module are deliberately untouched — they belong to
-Milestone 3 onward.)
+(none — Milestone 3 fully complete: widgets, theme, SlotManager with both bugs fixed,
+all four slots, the dashboard, the new `main.py` shell, and the `midi/` metadata modules
+it needs (`load.py`/`channel_remap.py`/`analyze.py`/`instruments.py`) are all done,
+unit-tested, and manually verified against real FluidSynth hardware. Traditional
+notation, recording, MIDI input/hardware, and the sequencer backend are deliberately
+untouched — Milestones 4 onward.)
 
 ## Decisions made or deviations from the plan
 - **`AudioEngine.load()` takes `(midi_bytes, tempo_map)`, not just `midi_bytes`** as
@@ -354,11 +576,190 @@ Milestone 3 onward.)
   (Milestone 2 loads bytes directly into the FluidSynth player, same as the old
   `engine.load_from_mem()` path, so it doesn't need `Timeline` populated either).
 
+### Milestone 3 deviations
+
+- **Resolved the previous session's channel-remap ambiguity**: `midi/channel_remap.py` is built
+  *now* (basic remap: unique channel per track, drum tracks pinned to 9), not deferred to
+  Milestone 5. Re-reading Plan Part 3.4/3.2/4 together, Milestone 5's scope is specifically
+  "channel-remap **edge-case** fixes" (>15 melodic tracks, multiple simultaneous drum tracks) —
+  wording that only makes sense if a non-edge-case remap already exists for it to extend. Without
+  a basic remap, per-track mute (explicitly part of Milestone 3's "feature parity" bar per Part 1's
+  Playback feature list) would be wrong on any file whose tracks share MIDI channels, which is
+  common. `channel_remap.py`'s module docstring records this reasoning inline so a future session
+  doesn't need to re-derive it.
+- **`App.seek_preview()` needed a real design change, not just a port**, because Milestone 2 moved
+  clock ownership into the `AudioEngine` (`get_clock_seconds()`), so there's no local `App.elapsed`
+  field left to freely overwrite during a timeline drag the way the old App did. Added
+  `App._preview_elapsed: float | None`; the `elapsed` property returns it when set, shadowing the
+  engine's clock for display and active-note computation without any engine calls during drag
+  motion. Only `seek()` (drag release / click-to-seek) actually calls `engine.seek()` and clears
+  `_preview_elapsed`. Consequence: `TimelineSlot`'s mouseup handler now calls `app.seek(app.elapsed)`
+  unconditionally before optionally resuming playback — necessary because `FluidPlayerBackend`'s own
+  `_elapsed` field (used internally by `play()`'s `silent_play_seek`) was never updated during the
+  preview-only drag and would otherwise resume from the pre-drag position on the next `play()`.
+  Verified in `tests/test_app.py`'s `AppSeekPreviewTest` and by direct event-simulation against both
+  a stub engine and `engine=None` (this session's smoke-test transcripts, not checked in).
+- **`render/dashboard.py` is much smaller than the old `ui/dashboard.py` (1145 lines) it replaces** —
+  no record-arm panel (Milestone 5: recording), no Bars/Traditional view toggle (Milestone 4: only
+  the bars view exists so far), no per-track delete (tied to the recording workflow in the old app,
+  Milestone 5). Not a scope cut — Milestone 3 just isn't building UI for features that don't exist
+  yet; both panels' worth of logic will land alongside the features that need them.
+- **No `render/slots/sheet_slot.py` dispatcher this milestone.** The old repo's `SheetSlot` picked
+  between `BarsSheetSlot`/`TraditionalSheetSlot` by `app.view`; with only the bars view built so
+  far, `BarsSlot` is registered directly under the `'sheet'` slot id in `SlotManager`. Milestone 4
+  adds the dispatcher (and an `app.view` field) when there's a second view to dispatch to —
+  introducing it now would be a single-branch abstraction with nothing to abstract over yet.
+- **`render/widgets/mini_keyboard.py` shares note-geometry (`is_black`/`white_index`), not a single
+  `draw()`.** `KeyboardSlot` (horizontal, interactive, click/drag-to-play) and `BarsSlot`'s piano
+  strip (vertical, display-only, sized to match the roll's note rows) render different enough things
+  that forcing one shared `draw()` would be an awkward abstraction for no real reuse — what was
+  actually duplicated in the old repo, and now isn't, is the black-key/white-key-index math, not the
+  rendering.
+- **`render/widgets/text_input.py` (`TextInput`) is built but not wired into anything.** Plan Part
+  3.4 lists it as one of Milestone 3's five widgets; the record-arm panel it was extracted from
+  (the old `ui/dashboard.py`'s hand-rolled cursor/editing code) is Milestone 5 (recording). Built now
+  as its own tested unit (`tests/test_text_input.py`) so M5 can wire it in directly.
+- **`midi/analyze.py` is a new file not named in Plan Part 3's tree** (the tree lists
+  `channel_remap.py`/`quantize.py`/`spelling.py`/`recorder.py`/`load.py`/`model.py` under `midi/`
+  but nothing for tempo/time-signature/key-signature extraction). Ported from the old repo's
+  `midi_analyzer.py` (a separate file there too) rather than folding into `load.py`, keeping the same
+  single-purpose split the old repo already had. `midi/instruments.py` similarly isn't named in
+  Part 3's tree — ported from the old `midi_instruments.py` since the properties panel needs GM
+  instrument/drum-kit names and there's no more natural home for them yet.
+- **Properties panel drops the recording-state indicator and the MIDI-input-device column** that the
+  old `ui/slots/properties.py` had — both read from `app.recorder`/`app.midi_input`, neither of
+  which exist yet (Milestone 5). `expanded_height()`'s row-count math was simplified accordingly
+  (no more "whichever of the left/right column is taller" — just the left column's fixed row count).
+
 ## Test results from this session
+- `python -m unittest discover -s tests -v` — **58/58 passing**: 25 carried forward
+  unchanged (Milestones 1-2 + the two post-M2 bugfixes) + 6 new in `test_app.py`
+  (track mute, keyboard passthrough, seek-preview) + 27 across four new files
+  (`test_channel_remap.py`: 5, `test_load.py`: 9, `test_slot_manager.py`: 5,
+  `test_text_input.py`: 8).
+- **`python main.py` against real FluidSynth hardware** (the install already configured
+  on this machine from Milestone 1/2): launched with the last real `recent_files` entry
+  (`HakunaMatata.mid` from the old repo's `midiTracks/`) auto-loading. Console showed
+  only the expected `[FluidPlayerBackend] audio driver: wasapi` + the known-benign
+  `wasapi: requested mode cannot be fully satisfied` line — no traceback, no
+  import/attribute errors, across a `timeout 6 python main.py` run (exit code 124 =
+  killed by the timeout after 6s of a healthy event loop, not a crash).
+- **Headless event-simulation smoke tests** (throwaway scripts against `SDL_VIDEODRIVER=
+  dummy`, not checked in — construct real `pygame.event.Event`s and dispatch them
+  through the actual `SlotManager`/`Dashboard`/`MenuBar` objects, no manual clicking
+  needed to verify wiring): loaded `twinkle.mid` via `App(engine=None)` and separately
+  via a stub engine shaped like `_StubEngine`, then exercised — Tracks button opens the
+  dropdown; clicking a track row toggles `enabled_tracks` and correctly shrinks
+  `note_events`; clicking outside the dropdown closes it; a full
+  mousedown/motion/mouseup timeline drag sequence (confirmed `elapsed` tracks the drag
+  preview live, then confirmed the stub engine's `seek()` was actually called with the
+  final dragged-to position on mouseup — this is the exact case the `seek_preview()`
+  redesign in Deviations exists to get right); clicking a piano key adds/removes from
+  `kb_notes`; clicking the properties `+/-` button expands the panel and grows its slot
+  height; dragging the bars view's scrollbar thumb (in an artificially short content
+  rect, to force `has_scroll=True`) updates `bars_scroll`; opening the View menu and
+  hovering "Color Theme" opens its submenu with the expected `theme:dark`/`theme:light`
+  items. All behaved as expected on first correct run (one early test bug on my end —
+  a click position inside the drag-handle strip triggered `SlotManager`'s
+  drag-to-reorder instead of reaching the slot, not a product bug — fixed by moving the
+  test's click x-coordinate past `HANDLE_W`).
+- `git status` — exactly the files listed under "Files touched" above are new/modified;
+  nothing stray, no leaked `__pycache__`.
+
+### Manual test steps for you to run
+1. `python -m unittest discover -s tests -v` — should show 61/61 passing (58 from this
+   milestone + 3 from the post-milestone Shift-sustain bugfix above).
+2. `python main.py` — window opens at 1200×720 titled "MidiVis": menu bar (File, View)
+   at the top, dashboard panel on the left (New File/Open File/Play/Reset/Tracks
+   buttons), and the timeline/bars/keyboard/properties slot stack filling the rest.
+3. **File > Open...**, pick a file from `midiTracks/` (e.g. `twinkle.mid`) — dashboard's
+   Play/Reset/Tracks buttons enable, the bars view fills with note rectangles, the
+   properties bar shows the filename + key/time-sig/tempo.
+4. **Space** or the dashboard's **Play** button — audible playback starts, notes light
+   up in the bars view and the on-screen keyboard as they play, the timeline fills.
+5. **Click the Tracks button** — dropdown opens with All/None + one row per track
+   (drum tracks, if any, grouped below a "Drums" separator). **Uncheck a track** — its
+   notes disappear from the bars view and go silent (audible if it was actively
+   sounding); re-check it to confirm both come back. Click **All**/**None** to confirm
+   the bulk toggles work and update the "N/M tracks" hint under the button.
+6. **Drag the timeline bar** while playing — should scrub smoothly (position preview
+   follows the mouse without any audio glitching *during* the drag itself), then resume
+   playing from the released position, not the pre-drag one. Try it again while paused —
+   should hold at the released position and start from there when you press Space (this
+   exercises the `seek_preview()`/`seek()` split called out in Deviations above — worth
+   testing carefully since it's a real design change, not a straight port).
+7. **Click and drag a key on the on-screen keyboard** — should sound a preview note
+   (bypassing track mute) and highlight; **Shift+click** a key to latch/sustain it,
+   click again to release. Then **Shift+click two or three different keys** (latching
+   each) and **release the Shift key** (not click anything) — all of them should cut
+   off immediately. This is the post-milestone bugfix above; before it, releasing
+   Shift did nothing and each note stayed stuck on until individually re-clicked.
+8. **Ctrl+scroll over the bars view** — zooms in/out (fewer/more measures visible).
+   **Plain scroll over the bars view** — scrolls the note-lane strip up/down.
+   **Shift+scroll or a horizontal trackpad swipe** over the bars view — nudges playback
+   position forward/back.
+9. **Drag a slot's handle strip** (the narrow grip on the left edge of each panel) to
+   reorder the stack — e.g. drag Properties above Bars — confirm the new order sticks
+   and that clicking within each panel still hits the right one (this exercises the
+   click-priority-vs-visual-order fix).
+10. **View > Slots**, uncheck one (e.g. Keyboard) — that panel disappears and the
+    flexible bars view grows to fill the space; re-check it to bring it back.
+11. **View > Color Theme > Light** — every panel (dashboard, menu bar, track dropdown,
+    all four slots) should re-theme, including the track dropdown, which the old app
+    left stuck in dark colors under Light theme (Plan Part 2's called-out bug — confirm
+    it's actually fixed here, not just structurally themed).
+12. **Resize the window** (drag an edge/corner) — panels reflow; shrinking narrow/short
+    enough should not crash (there's a `MIN_WIN_W`/`MIN_WIN_H` floor).
+13. Quit via **Esc** or the window's close button — clean exit, no traceback, no
+    orphaned `python.exe` holding the audio device afterward.
+14. **Regression check**: confirm play/pause/seek still behave exactly as Milestone 2's
+    hardware testing established (no regressions from moving those code paths under the
+    new UI) — the "seek while paused: audio may click for one frame" known issue is
+    still expected and unchanged.
+
+## Notes for the next session
+Start Milestone 4 (Notation/transcription + sprite atlas) per `FullRewritePlan.md`
+Part 4 and Part 3.3/3.2: `quantize.py` (rhythm quantization — duration → type/dots/
+tuplet, tie-across-barline), `spelling.py` (key-signature-aware enharmonic spelling),
+the glyph atlas pipeline (`assets/glyphs/` SVG source, `tools/build_atlas.py`,
+`notation/glyphs.py`'s `GlyphAtlas`), `notation/engraver.py` (Timeline + TempoMap →
+laid-out glyph placements, pure/no rendering), and the traditional grand-staff view
+built on top of it. Per Plan Part 3.3, there's an explicit open question worth a quick
+spike before committing: hand-drawn/commissioned glyph art vs. restyling an
+open-license SMuFL font (e.g. Bravura) toward the rounder/weightier SimplyPiano/Flowkey
+look — not blocking, but decide early since it shapes the whole atlas pipeline.
+
+This is also where `app.view` and a `render/slots/sheet_slot.py` dispatcher (picking
+between `BarsSlot` and the new traditional slot) need to be introduced — Milestone 3
+deliberately skipped both since there was only one view to dispatch to (see this
+session's Deviations). `BarsSlot` currently registers directly as the `'sheet'` slot id
+in `main.py`; that wiring is what needs to change to go through the new dispatcher
+instead, not `BarsSlot` itself.
+
+Reference material in the old `MidiVis` repo for Milestone 4: `ui/slots/
+traditional_sheet.py` (596 lines — the live grand-staff renderer; `ui/slots/
+midi_sheet_traditional.py` is the confirmed-dead pre-refactor leftover, don't use it)
+for the overall layout algorithm (staff positioning, stem/beam/ledger-line drawing,
+voice/staff assignment), but per Plan Part 3.3 the specific pieces to *replace* rather
+than port are: the OS-font clef lookup (silently disappears if `segoeuisymbol` lacks
+the glyphs — Plan Part 2's called-out failure mode), the literal-`'#'`-character
+accidentals (always sharp, ignores `app.key_sig`), and the hand-drawn Bézier rests.
+Keep stems/beams/ledger-lines/staff-lines procedural per Part 3.3 — they already look
+fine and are naturally resolution-independent.
+
+Nothing from Milestone 3 is left in a partial state — no cleanup needed before
+starting. `App.timeline`/`note_events`/`track_channels`/`instruments` and the
+`midi/load.py`/`channel_remap.py`/`analyze.py` modules from this session should be
+kept and built on, not rebuilt — the notation engraver consumes the same `Timeline`
+the bars view already does.
+
+---
+
+## Test results from Milestone 2 (previous session)
 - `python -m unittest discover -s tests -v` — 17/17 passing (9 from Milestone 1's
-  `test_model.py`, unchanged; 8 new in `test_app.py`). See "Files touched" above for
-  what `test_app.py` covers and the real bug it caught (`App.update()`'s DONE-detection
-  gating on `self.playing`, which is already `False` by the time status is `DONE`).
+  `test_model.py`, unchanged; 8 new in `test_app.py`). `test_app.py` caught a real bug
+  before it shipped (`App.update()`'s DONE-detection gating on `self.playing`, which is
+  already `False` by the time status is `DONE`).
 - **Real-hardware engine smoke test** (throwaway script, not checked in — exercised
   `FluidPlayerBackend` directly against the actual FluidSynth install/SoundFont, no
   pygame loop, to isolate engine mechanics from UI): loaded `midiTracks/twinkle.mid`,
@@ -390,81 +791,7 @@ Milestone 3 onward.)
 - `git status` — everything still untracked as expected (nothing committed, per
   policy); no `__pycache__` leaked (`.gitignore` from Milestone 1 still doing its job).
 
-### Manual test steps for you to run
-1. `python -m unittest discover -s tests -v` — should show 17/17 passing.
-2. `python main.py` — window opens titled "MidiVis", showing "No file loaded — Ctrl+O
-   to open" and the driver status line at the bottom (should say `[wasapi driver]` or
-   `[dsound driver]`/`[waveout driver]` if wasapi isn't available on your machine).
-3. **Ctrl+O**, pick a file from `midiTracks/` (e.g. `twinkle.mid`) — title updates to
-   the filename, elapsed/total time appears, status line shows "paused".
-4. **Space** — should start playing (audible), status line flips to "playing", the blue
-   bar fills left-to-right in real time, elapsed time counts up.
-5. **Space again** — pauses; elapsed stops advancing; press Space again to resume from
-   the same position (not from 0).
-6. **Click partway along the timeline bar** while paused — should jump the displayed
-   elapsed time to that position (may click/blip audibly for one frame — this is the
-   documented "seek while paused" known issue, not new this session). Press Space to
-   confirm it resumes playing from the clicked position, not from before the click.
-7. **Click near the very end of the bar while playing**, then wait — audio should
-   finish, the bar should stop advancing and reset to the start, status flips back to
-   "paused" with elapsed at 0:00 (may take a few seconds longer than the displayed
-   total time to actually stop — this is the FluidSynth audio-tail behavior noted
-   above, not a hang).
-8. Press Space again after that — should replay cleanly from the beginning.
-9. Quit via Esc or the window's close button — should exit cleanly, no traceback, no
-   lingering FluidSynth/audio process (Task Manager: no orphaned `python.exe` holding
-   the audio device after the window closes).
-10. **Regression check on Milestone 1's flow**: delete/rename `%APPDATA%\MidiVis2\settings.json`
-    and run `python main.py` again — should still auto-detect FluidSynth/SoundFont and
-    write a fresh settings file (Milestone 1's `ensure_audio_paths()` is unchanged
-    this session, but this confirms Milestone 2 didn't accidentally break the
-    first-run flow it depends on).
-
-## Notes for the next session
-Start Milestone 3 (UI shell + widgets + slots) per `FullRewritePlan.md` Part 4 and
-Part 3.4: `render/widgets/` (`Button`, `Menu`/`Submenu`, `Scrollbar`, `TextInput`,
-`MiniKeyboard`), theme consolidation (`render/theme.py`, including the Track dropdown
-and Record-arm panel the old repo left un-themed), `SlotManager` (fix the
-click-priority-vs-visual-order mismatch and single-flex-slot limitation while it's
-being built, not after), and the actual views: timeline, bars (piano-roll), keyboard,
-properties. Per Plan Part 4, this milestone should reach "feature parity with today's
-app apart from traditional notation" — i.e. track list + per-track mute (which needs
-`midi/channel_remap.py` — not yet built; check whether Milestone 3's scope expects a
-basic remap now or whether it's still deferred to Milestone 5's "channel-remap
-edge-case fixes," which implies *some* remap needs to exist before then for mute to
-work at all. Re-read Part 3.4/3.2 together before starting to resolve this — it
-wasn't fully unambiguous on a close read this session).
-
-Milestone 2's minimal shell UI in `main.py` (the 900×220 window, inline pygame
-drawing) is explicitly throwaway — Milestone 3 replaces it wholesale with the real
-`SlotManager`-based shell, not an incremental extension of it. Don't try to preserve
-or extend the current `main.py` UI code; keep only its settings/engine-construction
-bootstrapping (audio setup, `FluidPlayerBackend` construction, `atexit`-style shutdown)
-when writing the new entry point.
-
-`App` (`midivis/app.py`) will need to grow this milestone: track list (`tracks`,
-`enabled_tracks`, per-track mute calling `engine.set_channel_muted`), and probably
-`Timeline` population (`midi/load.py`, not yet built) if the bars view wants real note
-events rather than re-parsing the `mido.MidiFile` directly — check Plan Part 3
-(`midi/load.py`'s stated purpose: "SMF -> Timeline, replaces
-midi_processing.build_timeline/build_note_events") before deciding whether `load.py`
-belongs in this milestone or can wait. `App.tempo_map`/`total_dur`/`engine` from this
-session should be kept, not rebuilt.
-
-Reference material in the old `MidiVis` repo for Milestone 3: `ui/dashboard.py` (file
-open/track list/record-arm — but per Plan Part 3.4/CLAUDE.md, its hand-rolled
-`TextInput` and per-button hardcoded pixel offsets are exactly what `render/widgets/`
-should replace, not copy), `ui/menu_bar.py` (the six-times-duplicated hit-test/draw
-logic Part 3.4 wants collapsed into one `Menu`/`Submenu` widget), `ui/slot_manager.py`
-+ `ui/slots/timeline.py`/`keyboard.py`/`properties.py` (the SlotLayout pattern,
-including its two known bugs called out in Plan Part 2 — click-priority order and
-single-flex-slot — fix both while porting, not after), `ui/theme.py` (dark/light
-palettes to consolidate everything onto), `midi_processing.py` (`get_track_names`,
-`get_track_channels`, `remap_channels`, `get_instruments` — needed once track list +
-mute land; `remap_channels` specifically if Milestone 3 decides it needs basic remap
-now rather than deferring fully to Milestone 5).
-
-Nothing from Milestone 2 is left in a partial state — no cleanup needed before starting.
+Nothing from Milestone 2 was left in a partial state at the start of Milestone 3.
 
 ---
 
