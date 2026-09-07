@@ -1,29 +1,38 @@
 '''MidiVis entry point.
 
-Milestone 2 (Audio engine v1): FluidPlayerBackend behind the AudioEngine interface,
-wired to a deliberately minimal shell UI — this window exists to prove the audio
-engine end-to-end (open a file, play/pause, seek by clicking the timeline bar, see
-elapsed/total time), not as the real app shell. render/widgets, SlotManager, and the
-actual views (bars/traditional/keyboard/properties) are Milestone 3 (Plan Part 4) —
-this UI is throwaway and gets replaced wholesale then, not incrementally grown.
+Milestone 3 (UI shell + widgets + slots) replaces Milestone 2's deliberately
+throwaway 900x220 debug window with the real app shell: menu bar, dashboard
+(file open + track list/mute), and the SlotManager-driven panel stack
+(timeline, bars, keyboard, properties) — Plan Part 4's "feature parity with
+today's app apart from traditional notation." Only the settings/audio-setup/
+engine-construction bootstrapping from Milestone 2's main.py survives; the
+window/rendering code is new.
 '''
 from __future__ import annotations
 
 import os
 import signal
-import sys
 
 import pygame
 
 from midivis import settings as cfg
+from midivis.app import App
 from midivis.audio import setup as audio_setup
 from midivis.audio.fluid_player import FluidPlayerBackend
-from midivis.app import App
+from midivis.render import fonts as fonts_mod
+from midivis.render.dashboard import Dashboard
+from midivis.render.slots import BarsSlot, KeyboardSlot, PropertiesSlot, SlotManager, TimelineSlot
+from midivis.render.theme import get_theme
+from midivis.render.widgets.menu import MenuBar, MenuItem, TopMenu
 
-WIN_W, WIN_H = 900, 220
-TIMELINE_Y = 140
-TIMELINE_H = 24
-MARGIN = 24
+WIN_W, WIN_H = 1200, 720
+LEFT_W = 150
+MENU_H = 24
+MIN_WIN_W, MIN_WIN_H = 640, 400
+
+
+def _content_rect(win_w: int, win_h: int) -> pygame.Rect:
+    return pygame.Rect(LEFT_W, MENU_H, win_w - LEFT_W, win_h - MENU_H)
 
 
 def _open_file_dialog() -> str | None:
@@ -32,16 +41,11 @@ def _open_file_dialog() -> str | None:
 
     root = tk.Tk()
     root.withdraw()
+    root.attributes('-topmost', True)
     path = filedialog.askopenfilename(
-        title='Open MIDI file',
-        filetypes=[('MIDI files', '*.mid *.midi'), ('All files', '*.*')])
+        title='Open MIDI file', filetypes=[('MIDI files', '*.mid *.midi'), ('All files', '*.*')])
     root.destroy()
     return path or None
-
-
-def _fmt_time(seconds: float) -> str:
-    seconds = max(0, int(seconds))
-    return f'{seconds // 60}:{seconds % 60:02d}'
 
 
 def run() -> None:
@@ -57,11 +61,12 @@ def run() -> None:
 
     pygame.mixer.pre_init(0, 0, 0, 0)  # audio is handled by FluidSynth, not pygame's mixer
     pygame.init()
-    screen = pygame.display.set_mode((WIN_W, WIN_H))
+    flags = pygame.RESIZABLE | pygame.DOUBLEBUF
+    screen = pygame.display.set_mode((WIN_W, WIN_H), flags)
     pygame.display.set_caption('MidiVis')
+    win_w, win_h = WIN_W, WIN_H
     clock = pygame.time.Clock()
-    font = pygame.font.SysFont('segoeui', 18)
-    small_font = pygame.font.SysFont('segoeui', 14)
+    fonts = fonts_mod.get_fonts()
 
     engine = None
     try:
@@ -71,65 +76,142 @@ def run() -> None:
 
     app = App(engine)
 
+    dashboard = Dashboard(left_w=LEFT_W, menu_h=MENU_H)
+    slot_manager = SlotManager([
+        TimelineSlot(),
+        BarsSlot(),
+        KeyboardSlot(),
+        PropertiesSlot(),
+    ])
+
+    def _file_items() -> list[MenuItem]:
+        recent = user_settings.get('recent_files', [])
+        items = [MenuItem('new_file', 'New File...'), MenuItem('open', 'Open...')]
+        if recent:
+            items.append(MenuItem('sep', separator=True))
+            items.append(MenuItem('recent', 'Recent Files', submenu_fn=_recent_items))
+        return items
+
+    def _recent_items() -> list[MenuItem]:
+        recent = user_settings.get('recent_files', [])
+        if not recent:
+            return [MenuItem('none', '(no recent files)', enabled=False)]
+        return [MenuItem(f'recent:{p}', os.path.basename(p)) for p in recent]
+
+    def _view_items() -> list[MenuItem]:
+        return [
+            MenuItem('theme', 'Color Theme', submenu_fn=_theme_items),
+            MenuItem('slots', 'Slots', submenu_fn=_slots_items),
+        ]
+
+    def _theme_items() -> list[MenuItem]:
+        current = user_settings.get('theme', 'dark')
+        return [
+            MenuItem('theme:dark', 'Dark', checked=(current == 'dark')),
+            MenuItem('theme:light', 'Light', checked=(current == 'light')),
+        ]
+
+    def _slots_items() -> list[MenuItem]:
+        entries = [('timeline', 'Timeline'), ('sheet', 'Sheet'),
+                   ('keyboard', 'Keyboard'), ('properties', 'Properties')]
+        return [MenuItem(f'slot_toggle:{sid}', label, checked=slot_manager.is_visible(sid))
+                for sid, label in entries]
+
+    menu = MenuBar([
+        TopMenu('file', 'File', _file_items, width=200, submenu_width=240),
+        TopMenu('view', 'View', _view_items, width=200, submenu_width=145),
+    ], height=MENU_H)
+
+    def _cleanup() -> None:
+        app.shutdown()
+
+    import atexit
+    atexit.register(_cleanup)
+
     recent = user_settings.get('recent_files', [])
     if recent and os.path.isfile(recent[0]):
-        app.load(recent[0])
+        dashboard.load_file(app, user_settings, recent[0])
 
-    timeline_rect = pygame.Rect(MARGIN, TIMELINE_Y, WIN_W - 2 * MARGIN, TIMELINE_H)
-
-    def _open_file() -> None:
-        path = _open_file_dialog()
-        if path and app.load(path):
-            cfg.add_recent_file(user_settings, path)
-
+    content = _content_rect(win_w, win_h)
     running = True
+    seek_delta = 0.0
+
     while running:
+        mouse_pos = pygame.mouse.get_pos()
+        dashboard.update(mouse_pos)
+        seek_delta = 0.0
+
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
-            elif event.type == pygame.KEYDOWN:
+
+            if event.type == pygame.VIDEORESIZE:
+                win_w = max(MIN_WIN_W, event.w)
+                win_h = max(MIN_WIN_H, event.h)
+                content = _content_rect(win_w, win_h)
+
+            action = menu.handle_event(event, fonts['normal'])
+            if action in ('new_file', 'open'):
+                menu.close()
+                if action == 'new_file':
+                    dashboard.new_file_dialog(app, user_settings)
+                else:
+                    dashboard.open_file_dialog(app, user_settings)
+                continue
+            if action and action.startswith('recent:'):
+                dashboard.load_file(app, user_settings, action[len('recent:'):])
+                continue
+            if action and action.startswith('theme:'):
+                user_settings['theme'] = action[len('theme:'):]
+                cfg.save(user_settings)
+                continue
+            if action and action.startswith('slot_toggle:'):
+                slot_manager.toggle_visible(action[len('slot_toggle:'):])
+                continue
+            if action == 'consumed':
+                continue
+
+            slot_manager.handle_event(
+                event, content, app,
+                pre_reorder_cb=lambda e: dashboard.handle_dropdown_event(e, app),
+                menu_open=menu.is_open,
+            )
+
+            if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     running = False
                 elif event.key == pygame.K_SPACE and app.loaded:
-                    if app.playing:
-                        app.pause()
-                    else:
-                        app.play()
+                    app.pause() if app.playing else app.play()
                 elif event.key == pygame.K_o and pygame.key.get_mods() & pygame.KMOD_CTRL:
-                    _open_file()
-            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                if app.loaded and timeline_rect.collidepoint(event.pos):
-                    frac = (event.pos[0] - timeline_rect.x) / timeline_rect.w
-                    app.seek(frac * app.total_dur)
+                    path = _open_file_dialog()
+                    if path:
+                        dashboard.load_file(app, user_settings, path)
+
+            if (event.type == pygame.MOUSEWHEEL and app.loaded and not menu.is_open
+                    and not dashboard.dropdown_collidepoint(mouse_pos, app.tracks)):
+                sh_rect = slot_manager.rects(content).get('sheet')
+                if sh_rect and sh_rect.collidepoint(mouse_pos):
+                    ctrl = bool(pygame.key.get_mods() & pygame.KMOD_CTRL)
+                    if event.y != 0:
+                        if ctrl:
+                            app.sheet_zoom = max(0.25, min(4.0, app.sheet_zoom * 1.15 ** event.y))
+                        else:
+                            app.bars_scroll = max(0.0, min(1.0, app.bars_scroll + 0.08 * (-event.y)))
+                    if event.x != 0:
+                        seek_delta += (60.0 / app.bpm) * event.x
+
+            dashboard.handle_panel_event(event, app, user_settings, menu)
+
+        if seek_delta:
+            app.seek(app.elapsed + seek_delta)
 
         app.update()
-
-        screen.fill((18, 18, 24))
-
-        title = app.title if app.loaded else 'No file loaded — Ctrl+O to open'
-        screen.blit(font.render(title, True, (230, 230, 235)), (MARGIN, 24))
-
-        hint = 'Space = play/pause    Ctrl+O = open    click bar = seek    Esc = quit'
-        screen.blit(small_font.render(hint, True, (140, 140, 150)), (MARGIN, 56))
-
-        pygame.draw.rect(screen, (60, 60, 70), timeline_rect, border_radius=4)
-        if app.loaded and app.total_dur > 0:
-            frac = max(0.0, min(1.0, app.elapsed / app.total_dur))
-            fill_w = int(timeline_rect.w * frac)
-            if fill_w > 0:
-                fill_rect = pygame.Rect(timeline_rect.x, timeline_rect.y, fill_w, timeline_rect.h)
-                pygame.draw.rect(screen, (90, 160, 220), fill_rect, border_radius=4)
-
-        time_text = (f'{_fmt_time(app.elapsed)} / {_fmt_time(app.total_dur)}'
-                     if app.loaded else '--:-- / --:--')
-        screen.blit(small_font.render(time_text, True, (200, 200, 210)),
-                    (MARGIN, TIMELINE_Y + TIMELINE_H + 8))
-
-        status = ('playing' if app.playing else 'paused') if app.loaded else ''
-        driver = f'  [{engine.driver_name} driver]' if engine else '  [no audio — FluidSynth init failed]'
-        screen.blit(small_font.render(status + driver, True, (140, 140, 150)),
-                    (MARGIN, TIMELINE_Y + TIMELINE_H + 30))
-
+        pal = get_theme(user_settings)
+        screen.fill((10, 10, 18))   # barely visible -- panels fully cover the window
+        slot_manager.render(screen, content, app, fonts, user_settings)
+        slot_manager.draw_drag_indicator(screen, content)
+        dashboard.draw(screen, fonts, app, win_h, user_settings)
+        menu.draw(screen, fonts['normal'], pal, win_w)
         pygame.display.flip()
         clock.tick(60)
 

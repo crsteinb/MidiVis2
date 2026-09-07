@@ -16,6 +16,7 @@ MAX_RECENT = 5
 
 _DEFAULTS = {
     'recent_files': [],   # list of absolute paths, most recent first
+    'theme': 'dark',       # 'dark' | 'light'
     'midi_inputs': {},
     'recording': {
         'channel': 0,
