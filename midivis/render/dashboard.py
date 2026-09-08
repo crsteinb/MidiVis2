@@ -178,6 +178,13 @@ class _TrackDropdown:
             self._hover_row = row if panel.collidepoint(event.pos) and row is not None else -1
             return False
 
+        if event.type == pygame.MOUSEWHEEL:
+            # No `pos` on wheel events -- use the live cursor. Consumed-but-
+            # inert (matches the old main.py exclusion this replaces): wheel
+            # over the open dropdown must not fall through to sheet
+            # zoom/scroll, since the dropdown panel can visually overlap it.
+            return panel.collidepoint(pygame.mouse.get_pos())
+
         return False
 
     def draw(self, screen, app, font, pal):

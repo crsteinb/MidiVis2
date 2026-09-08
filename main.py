@@ -157,12 +157,10 @@ def run() -> None:
 
     content = _content_rect(win_w, win_h)
     running = True
-    seek_delta = 0.0
 
     while running:
         mouse_pos = pygame.mouse.get_pos()
         dashboard.update(mouse_pos)
-        seek_delta = 0.0
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -216,28 +214,9 @@ def run() -> None:
                     if path:
                         dashboard.load_file(app, user_settings, path)
 
-            if (event.type == pygame.MOUSEWHEEL and app.loaded and not menu.is_open
-                    and not dashboard.dropdown_collidepoint(mouse_pos, app.tracks)):
-                sh_rect = slot_manager.rects(content).get('sheet')
-                if sh_rect and sh_rect.collidepoint(mouse_pos):
-                    ctrl = bool(pygame.key.get_mods() & pygame.KMOD_CTRL)
-                    if event.y != 0:
-                        if ctrl:
-                            # Max raised from 4.0 -- at MEASURES_VISIBLE=8
-                            # (bars.py/traditional.py), 4.0 only ever got
-                            # down to 2 measures across the full width, not
-                            # enough to make individual notes/stems legible
-                            # in a dense passage. 16.0 gets to half a
-                            # measure -- room to raise further if still not
-                            # tight enough.
-                            app.sheet_zoom = max(0.25, min(16.0, app.sheet_zoom * 1.15 ** event.y))
-                        else:
-                            app.bars_scroll = max(0.0, min(1.0, app.bars_scroll + 0.08 * (-event.y)))
-                    if event.x != 0:
-                        seek_delta += (60.0 / app.bpm) * event.x
-
             dashboard.handle_panel_event(event, app, user_settings, menu)
 
+        seek_delta = slot_manager.take_seek_delta()
         if seek_delta:
             app.seek(app.elapsed + seek_delta)
 

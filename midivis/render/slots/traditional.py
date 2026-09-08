@@ -228,7 +228,7 @@ class TraditionalSlot(SlotBase):
                 if nid not in geoms or nid in beamed:
                     continue
                 note_x, positions, color = geoms[nid]
-                self._draw_chord(screen, note_x, positions, n.note_type, n.dots, color, n.staff)
+                self._draw_chord(screen, note_x, positions, n.note_type, n.dots, color, n.staff, pal)
 
             for i, n in enumerate(engraving.notes):
                 if not n.tie_next or i + 1 >= len(engraving.notes):
@@ -264,19 +264,32 @@ class TraditionalSlot(SlotBase):
 
     # ── Chord / beam drawing ─────────────────────────────────────────────
 
-    def _draw_chord_heads(self, screen, note_x, positions, note_type, color):
+    def _draw_chord_heads(self, screen, note_x, positions, note_type, color, pal):
         acc_glyph = {1: 'accidentalSharp', -1: 'accidentalFlat'}
-        for _step, y, _note, accidental in positions:
-            name = 'noteheadWhole' if note_type == 'whole' else (
-                'noteheadHalf' if note_type == 'half' else 'noteheadBlack')
+        name = 'noteheadWhole' if note_type == 'whole' else (
+            'noteheadHalf' if note_type == 'half' else 'noteheadBlack')
+        head_x = note_x - self._notehead_w // 2
+        # A close interval (e.g. a second) draws its two noteheads at nearly
+        # the same spot, and same-color fills alone read as one indistinct
+        # blob (reported by the user from a screenshot). Draw highest pitch
+        # first / lowest last so the lower note -- conventionally the more
+        # structurally important voice -- ends up on top, fully outlined,
+        # rather than partly covered by whatever was drawn after it.
+        for _step, y, _note, accidental in sorted(positions, key=lambda p: p[2], reverse=True):
             # note_x is this chord's notehead *center* (see the caller);
             # GlyphAtlas anchors noteheads at their own left edge, so shift
             # left by half the (reference) notehead width to center it.
-            self._atlas.blit(screen, name, GLYPH_TIER, note_x - self._notehead_w // 2, y, color=color)
+            self._atlas.blit(screen, name, GLYPH_TIER, head_x, y, color=color)
+            self._atlas.draw_outline(screen, name, GLYPH_TIER, head_x, y, pal['trad_note_outline'])
             if accidental in acc_glyph:
                 glyph = self._atlas.get(acc_glyph[accidental], GLYPH_TIER)
+                # `blit`'s x is the glyph's left edge (accidentals' anchor_x
+                # is 0, same as noteheads) -- subtracting only half the
+                # glyph's width here (as if centering it) left its right half
+                # overlapping the notehead. Subtract the full width instead
+                # so the accidental sits entirely to the left, with a gap.
                 self._atlas.blit(screen, acc_glyph[accidental], GLYPH_TIER,
-                                  note_x - self._notehead_w // 2 - glyph.surface.get_width() // 2 - 2,
+                                  note_x - self._notehead_w // 2 - glyph.surface.get_width() - 2,
                                   y, color=color)
 
     def _draw_dots(self, screen, note_x, positions, dots, color):
@@ -289,8 +302,8 @@ class TraditionalSlot(SlotBase):
             for d in range(dots):
                 self._atlas.blit(screen, 'augmentationDot', GLYPH_TIER, dot_x + d * 6, dy, color=color)
 
-    def _draw_chord(self, screen, note_x, positions, note_type, dots, color, staff):
-        self._draw_chord_heads(screen, note_x, positions, note_type, color)
+    def _draw_chord(self, screen, note_x, positions, note_type, dots, color, staff, pal):
+        self._draw_chord_heads(screen, note_x, positions, note_type, color, pal)
         self._draw_dots(screen, note_x, positions, dots, color)
         if note_type == 'whole':
             return
@@ -311,7 +324,7 @@ class TraditionalSlot(SlotBase):
         beam_y = int(sum(t for _s, _b, t in stems) / len(stems))
 
         for _nid, n, (x, positions, color) in chords:
-            self._draw_chord_heads(screen, x, positions, n.note_type, color)
+            self._draw_chord_heads(screen, x, positions, n.note_type, color, pal)
 
         for (_nid, _n, (_x, _pos, color)), (sx, y_base, _tip) in zip(chords, stems):
             pygame.draw.line(screen, color, (sx, y_base), (sx, beam_y), 2)

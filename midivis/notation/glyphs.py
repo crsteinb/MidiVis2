@@ -37,6 +37,7 @@ class GlyphAtlas:
         self._glyphs = manifest['glyphs']
         self._cache: dict[tuple[str, str], Glyph] = {}
         self._tint_cache: dict[tuple[str, str, tuple[int, int, int]], pygame.Surface] = {}
+        self._outline_cache: dict[tuple[str, str], list[tuple[int, int]]] = {}
 
     def tiers(self) -> list[str]:
         '''Tier names sorted by ascending staff-space size.'''
@@ -92,3 +93,30 @@ class GlyphAtlas:
             screen.blit(glyph.surface, pos)
         else:
             screen.blit(self._tinted(name, tier, glyph, color), pos)
+
+    def _outline_points(self, name: str, tier: str) -> list[tuple[int, int]]:
+        key = (name, tier)
+        cached = self._outline_cache.get(key)
+        if cached is not None:
+            return cached
+        points = pygame.mask.from_surface(self.get(name, tier).surface).outline()
+        self._outline_cache[key] = points
+        return points
+
+    def draw_outline(self, screen: pygame.Surface, name: str, tier: str, x: int, y: int,
+                       color: tuple[int, int, int], width: int = 1) -> None:
+        '''Trace a thin stroke around a glyph already blitted at (x, y) (same
+        anchor convention as blit()), using its actual alpha silhouette
+        (pygame.mask) rather than an approximate bounding shape -- so it
+        follows a tilted/elliptical notehead's real outline. Two overlapping
+        same-color noteheads (e.g. a two-note chord a step apart) otherwise
+        blend into one indistinct blob; the outline gives each its own
+        visible boundary.
+        '''
+        points = self._outline_points(name, tier)
+        if len(points) < 2:
+            return
+        glyph = self.get(name, tier)
+        ox, oy = x - glyph.anchor_x, y - glyph.anchor_y
+        shifted = [(px + ox, py + oy) for px, py in points]
+        pygame.draw.lines(screen, color, True, shifted, width)

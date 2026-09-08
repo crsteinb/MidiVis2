@@ -1309,6 +1309,42 @@ weightier look) is out of scope for this session specifically, not abandoned.)
    on this point).
 10. Quit via Esc — clean exit, no traceback.
 
+## Pre-Milestone-5 cleanup: sheet wheel handling moved out of main.py
+
+**Not a milestone** — Plan scope is unchanged; this corrects a present inconsistency
+before Milestone 5 (input routing) would otherwise have added a second ad hoc input
+block on top of it.
+
+**Problem**: `main.py`'s event loop had a 20-line `MOUSEWHEEL` special case
+(ctrl+wheel zoom, plain-wheel scroll, horizontal-wheel seek) that bypassed the
+`SlotBase.handle_event`/`SlotManager.handle_event` dispatch every other slot-owned
+interaction already goes through — it did its own hit-testing against
+`slot_manager.rects(content)` and wrote directly into `app.sheet_zoom`/
+`app.bars_scroll`. This had already caused a real bug: the scroll branch always wrote
+`bars_scroll`, so wheel-scroll silently did nothing in the traditional view (which
+reads `trad_scroll`).
+
+**Fix**: moved the logic into `SheetSlot.handle_event` (`render/slots/sheet_slot.py`),
+which already knows which view (`bars`/`traditional`) is active, so it now writes the
+*correct* scroll attribute — fixing the bug as a side effect. Horizontal-wheel seek has
+no natural per-slot owner (it drives playback), so `handle_event` returns a
+`('seek', delta)` signal; `SlotManager` accumulates it in a new `take_seek_delta()`
+(mirroring the existing `'properties_toggle'` special-case pattern) and `main.py` reads
+it once per frame instead of accumulating a local variable itself. The dashboard's
+track-dropdown wheel-exclusion (dropdown can visually overlap the sheet rect) moved
+into `_TrackDropdown.handle_event` alongside its other owned events, rather than staying
+as a `main.py`-level guard.
+
+Files touched: `render/slots/sheet_slot.py`, `render/slots/slot_manager.py`,
+`render/dashboard.py`, `main.py`. New test file `tests/test_sheet_wheel.py` (9 tests:
+zoom clamping both directions, per-view scroll incl. the traditional-view regression
+case, scroll clamping, seek signal shape, position-outside-rect gating, not-loaded
+gating). No slot's `handle_event` contract changed shape (still `event, rect, app ->
+bool | str`, now also `| tuple[str, float]` for the sheet slot specifically) — deferred
+extending it to `KEYDOWN`/`KEYUP` since no slot needs that yet; Milestone 5's
+computer-keyboard piano input should be the first thing to route through this same
+mechanism rather than adding a third ad hoc block to `main.py`.
+
 ## Notes for the next session
 Start Milestone 5 (Recording + MIDI input) per `FullRewritePlan.md` Part 4 and Part
 3.2/3.6/3.7: tempo-map-aware `midi/recorder.py` (replacing the old single-tempo-frozen-

@@ -38,6 +38,7 @@ class SlotManager:
         self._hidden: set[str] = set()
         self._drag_id: str | None = None
         self._drag_y: int = 0
+        self._pending_seek: float = 0.0
 
     # ── Layout ────────────────────────────────────────────────────────────
 
@@ -80,6 +81,15 @@ class SlotManager:
 
     def get_slot(self, slot_id: str) -> SlotBase | None:
         return self._slots.get(slot_id)
+
+    def take_seek_delta(self) -> float:
+        '''Pop and reset the seek delta accumulated by SheetSlot's
+        horizontal-wheel handling this frame (Plan Part 3.4's fix for the old
+        main.py wheel special-case) — main.py calls this once per frame,
+        after draining all events, and applies it to playback.
+        '''
+        delta, self._pending_seek = self._pending_seek, 0.0
+        return delta
 
     @property
     def order(self) -> list[str]:
@@ -151,6 +161,9 @@ class SlotManager:
                                  if getattr(app, 'properties_expanded', False)
                                  else props.fixed_height)
                         self.set_height('properties', new_h)
+                    consumed = True
+                elif slot_id == 'sheet' and isinstance(result, tuple) and result[0] == 'seek':
+                    self._pending_seek += result[1]
                     consumed = True
                 elif result:
                     consumed = True

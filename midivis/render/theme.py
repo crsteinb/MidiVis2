@@ -99,6 +99,7 @@ THEMES: dict[str, dict] = {
         'trad_note':        (80,  140, 220),
         'trad_note_past':   (75,  80,  100),
         'trad_note_act':    (220, 60,  60),
+        'trad_note_outline': (15,  15,  18),
         'trad_measure_num': (175, 170, 155),
     },
     'light': {
@@ -180,6 +181,7 @@ THEMES: dict[str, dict] = {
         'trad_note':        (25,  55,  135),
         'trad_note_past':   (125, 125, 158),
         'trad_note_act':    (200, 25,  25),
+        'trad_note_outline': (200, 195, 180),
         'trad_measure_num': (140, 120, 90),
     },
 }
