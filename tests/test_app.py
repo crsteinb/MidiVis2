@@ -199,5 +199,56 @@ class AppKeyboardPassthroughTest(unittest.TestCase):
         self.assertIn((0, 60), engine.notes_off)
 
 
+class ActiveNotesOverlapTest(unittest.TestCase):
+    '''A single track can legitimately retrigger the same pitch before its
+    previous sounding ends -- midi/load.py's FIFO-per-(note,channel,track)
+    pairing produces two overlapping or back-to-back NoteEvents for the same
+    note in that case. active_notes must track *open instance count* per
+    note, not just "is this note on at all", or one instance's note-off
+    incorrectly clears a still-sounding second instance (reported by the
+    user on a real file: bars-view/keyboard highlighting dropping early, or
+    persisting past where a note's own bar ends).
+    '''
+
+    def _app(self):
+        return App(engine=None)
+
+    def test_overlapping_same_pitch_stays_active_until_the_last_release(self):
+        app = self._app()
+        # on(inst1), on(inst2) -- retriggered before inst1 released, off(inst1), off(inst2)
+        app._apply_event(0, 60)
+        app._apply_event(0, 60)
+        self.assertIn(60, app.active_notes)
+        app._apply_event(1, 60)   # inst1 releases -- inst2 is still sounding
+        self.assertIn(60, app.active_notes, 'note must stay active while a second instance is still open')
+        app._apply_event(1, 60)   # inst2 releases -- now truly done
+        self.assertNotIn(60, app.active_notes)
+
+    def test_back_to_back_same_pitch_never_flickers_inactive(self):
+        app = self._app()
+        app._apply_event(0, 60)
+        app._apply_event(1, 60)
+        app._apply_event(0, 60)   # retriggered immediately
+        self.assertIn(60, app.active_notes)
+        app._apply_event(1, 60)
+        self.assertNotIn(60, app.active_notes)
+
+    def test_unrelated_notes_are_unaffected_by_the_counter(self):
+        app = self._app()
+        app._apply_event(0, 60)
+        app._apply_event(0, 64)
+        app._apply_event(1, 60)
+        self.assertNotIn(60, app.active_notes)
+        self.assertIn(64, app.active_notes)
+
+    def test_reset_playback_clears_the_instance_counts(self):
+        app = self._app()
+        app._apply_event(0, 60)
+        app._apply_event(0, 60)
+        app._reset_playback()
+        self.assertEqual(app.active_notes, set())
+        self.assertEqual(app._active_note_counts, {})
+
+
 if __name__ == '__main__':
     unittest.main()

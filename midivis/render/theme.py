@@ -88,6 +88,18 @@ THEMES: dict[str, dict] = {
         'props_sep':     (50,  50,  68),
         'props_btn_bg':  (40,  42,  60),
         'props_btn_fg':  (160, 165, 195),
+
+        # Traditional (grand staff) notation slot
+        'trad_bg':          (24,  24,  28),
+        'trad_bg_clef':     (18,  18,  22),
+        'trad_divider':     (55,  55,  70),
+        'trad_staff':       (185, 185, 200),
+        'trad_bar':         (140, 140, 160),
+        'trad_playhead':    (220, 60,  60),
+        'trad_note':        (80,  140, 220),
+        'trad_note_past':   (75,  80,  100),
+        'trad_note_act':    (220, 60,  60),
+        'trad_measure_num': (175, 170, 155),
     },
     'light': {
         'handle':      (180, 178, 170),
@@ -158,6 +170,17 @@ THEMES: dict[str, dict] = {
         'props_sep':     (190, 185, 168),
         'props_btn_bg':  (218, 215, 205),
         'props_btn_fg':  (60,  58,  48),
+
+        'trad_bg':          (248, 246, 238),
+        'trad_bg_clef':     (236, 234, 222),
+        'trad_divider':     (170, 165, 148),
+        'trad_staff':       (15,  15,  15),
+        'trad_bar':         (40,  40,  40),
+        'trad_playhead':    (175, 0,   0),
+        'trad_note':        (25,  55,  135),
+        'trad_note_past':   (125, 125, 158),
+        'trad_note_act':    (200, 25,  25),
+        'trad_measure_num': (140, 120, 90),
     },
 }
 

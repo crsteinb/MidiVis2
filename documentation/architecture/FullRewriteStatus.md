@@ -4,8 +4,403 @@ Repo: C:\Users\crste\git\MidiVis2
 Plan: documentation/architecture/FullRewritePlan.md
 
 ## Current milestone
-3 — UI shell + widgets + slots (done, plus three post-milestone bugfixes below;
-awaiting your test/commit)
+4 — Notation/transcription + sprite atlas (done, plus seven post-milestone bugfixes
+and one requested enhancement below; awaiting your test/commit)
+
+## Post-Milestone-4 enhancement: "note accuracy threshold" setting
+
+**Request**: in the traditional (sheet music) view, favor readability over strict
+fidelity to MIDI timing — minor overlaps or late releases (ordinary performance noise)
+should be ignored, with notes clamped to the nearest 1/32 note. Make the grid
+resolution a setting rather than a hardcoded value.
+
+**Design**: this is a *display-only* transform, applied fresh every time a file is
+engraved — it never touches `Timeline.note_events`, playback, or the bars view's
+active-note highlighting (all of which intentionally keep exact MIDI timing; the
+readability tradeoff is specifically a notation-page concern, not a "the app plays the
+wrong thing" concern).
+
+- `midi/quantize.py` gained `snap_tick()`/`snap_note_span()`: snap an absolute tick (or
+  both ends of a note) to the nearest point on a fixed rhythmic grid,
+  `grid_denominator=32` by default (nearest 1/32 note), `grid_denominator=0` disabling
+  snapping entirely for an "exact timing" option. `snap_note_span` also guards against
+  a degenerate zero-length note if both ends round to the same grid point.
+  `DEFAULT_SNAP_GRID = 32` is the one shared constant everything else below reads,
+  instead of the value being duplicated across files.
+- `notation/engraver.py`'s `engrave()` gained a `grid_denominator` parameter (default
+  `quantize.DEFAULT_SNAP_GRID`) and now snaps every note's onset/release *before*
+  chord grouping, rest-gap detection, or tie-splitting ever see it — building a fresh
+  list of `NoteEvent`s rather than mutating the ones passed in, so `Timeline` itself
+  stays untouched. This fixes the motivating case directly: a note released a few
+  ticks late (overlapping the next note's onset) now snaps both ends onto the same
+  clean grid point, removing the overlap instead of engraving it literally.
+- `settings.py` gained a `'notation': {'snap_grid': 32}` default — the user-facing
+  "note accuracy threshold".
+- `App` gained `notation_snap_grid` (read from settings at startup in `main.py`, passed
+  to `engraver.engrave()` in `load()`) and `set_notation_snap_grid(value)`, which
+  updates the setting *and* immediately re-engraves the currently-loaded file (cheap —
+  one pass over the file's notes, not a per-frame cost) so a menu change takes effect
+  right away rather than only on the next file open.
+- **View > Note Accuracy** menu (new, alongside the existing Color Theme/Slots
+  submenus): Exact Timing / 1/16 Note / 1/32 Note (Recommended, the default) / 1/64
+  Note, each a direct `app.set_notation_snap_grid(...)` + persisted to
+  `settings['notation']['snap_grid']`. This is the "provide in the setting" half of the
+  request — a real, discoverable UI control, not just an internal constant.
+
+**Verification**: confirmed live-switching actually re-engraves with different data —
+loaded `twinkle.mid`, sampled the first few engraved notes' ticks at the default 1/32
+grid, then called `set_notation_snap_grid(0)` (exact timing) and confirmed the same
+notes' ticks changed to their raw, unsnapped values (0,240→0,230 for the sampled
+notes), then switched to a 1/16 grid and confirmed it re-engraved without error.
+Re-rendered the traditional view headless and ran the full app-shell smoke test
+(including simulating a real menu item click path) after wiring — no regressions.
+Real-hardware `python main.py` launch still clean.
+
+**Regression tests added**: `tests/test_quantize.py` gained `SnapTickTest` (3 tests)
+and `SnapNoteSpanTest` (4 tests) covering the grid math directly, including the exact
+"late release overlapping the next note" and "early overlapping onset" scenarios from
+the request, and the zero-denominator disable path. `tests/test_engraver.py` gained
+`NoteAccuracyThresholdTest` (3 tests): the same late-release-overlap scenario run
+through the full `engrave()` pipeline and confirmed clean (no overlap survives), exact
+timing preserved when `grid_denominator=0`, and a coarser 1/16 grid producing different
+(more aggressively snapped) results than the default.
+`python -m unittest discover -s tests -v` — **124/124 passing** (113 from before + 11
+new).
+
+## Post-Milestone-4 bugfixes (reported by user, fixed same session as reported)
+
+### Bugfix 7: implausible double-dotted notes on ordinary sustained notes
+**Symptom** (reported with a screenshot): a half note rendered with two augmentation
+dots after it, in a spot that didn't musically make sense.
+
+**Root cause**: `midi/quantize.py`'s `classify_duration()` picked the *nearest*
+candidate duration by log-ratio distance, and double-dotted values (e.g. a
+double-dotted half = exactly 3.5 beats) were in that candidate pool alongside plain
+and single-dotted ones. Real (non-machine-quantized) MIDI files routinely encode a
+sustained note a bit short of its "intended" round value — a note's natural release
+trailing off before the next note starts, an early note-off, an export quirk —
+commonly landing 10-15% short of a round number. A whole note performed as 3.5 out of
+4 beats is numerically *closer* to "double-dotted half" (exactly 3.5) than to "whole"
+(4.0, ~13% away) or "dotted half" (3.0, ~15% away), so the classifier picked the
+double-dot — technically the nearest fit, but not what a human transcribing the same
+performance would ever write, since double-dotted notation is rare and specifically
+reserved for genuinely precise 3.5-beat rhythms, not inferred from an approximately
+whole-note-length performed note. Confirmed via a direct dump across all four sample
+files: every double-dot classification had a raw duration in the 3.45-3.6 beat range
+(or, for a quarter-note case in `MIDI C Major.mid`, 1.7-1.9 beats) — imprecise timing,
+not an intentional double-dot anywhere.
+
+**Fix**: capped `_DOT_MULT` at a single dot (`{0: 1.0, 1: 1.5}`, removing the `2: 1.75`
+entry) — double-dots are rare enough in practice that this classifier should never
+reach for one as a "closest fit" guess; it now falls back to whichever ordinary
+single-dot-or-plain candidate is nearest instead. `DurationClass.dots`'s docstring
+updated from "0, 1, or 2" to "0 or 1" to match.
+
+**Verification**: re-ran the double-dot dump across all four sample files
+(`twinkle.mid`, `UndertaleMegalovania.mid`, `MIDI C Major.mid`, `HakunaMatata.mid`) —
+zero notes classified with `dots >= 2` anywhere now (previously 20/2/2/29
+respectively). Re-rendered the traditional view headless to confirm the fix doesn't
+introduce any new visual regressions.
+
+**Regression test updated**: `tests/test_quantize.py`'s `test_double_dotted_half` was
+asserting the *old* (now-removed) behavior; replaced with
+`test_dots_are_capped_at_one_even_for_an_exact_double_dot_value`, which feeds
+`classify_duration()` the exact double-dot value (3.5 beats) and asserts it now falls
+back to a plain whole note (`dots=0`) instead — the fix's actual behavior, not just
+"dots never exceeds 1" as an isolated assertion.
+`python -m unittest discover -s tests -v` — **113/113 passing** (one test's expected
+values changed, none added/removed).
+
+### Bugfix 6: overlapping/back-to-back same-pitch notes lost active-note highlighting early (or kept it too long)
+**Symptom** (reported on `twinkle.mid`, one track unmuted): during playback, some
+notes' highlight (bars-view piano strip / on-screen keyboard) didn't stay lit for the
+note's full length, and in other cases stayed lit briefly after the bar had visibly
+finished. User correctly diagnosed the likely mechanism themselves: "the second
+overlapping note is clearing its highlight when the first note is released."
+
+**Root cause**: `App.active_notes` was a plain `set[int]` — membership only, no
+concept of "how many instances of this note are currently open." A single track can
+legitimately retrigger the same pitch before its previous sounding ends (this is
+exactly what `midi/load.py`'s `_events_to_notes` already models correctly, via a FIFO
+queue per `(note, channel, track_id)` that pairs each note-on with the *next*
+note-off — a real, common pattern for sustained/pedaled instruments, not a malformed
+file). When that happens, `App._flat_events` contains two overlapping or back-to-back
+(start, end) spans for the *same* note number. Processing them against a boolean set,
+the first instance's note-off called `.discard(note)` unconditionally — turning the
+note off in `active_notes` even while a second, still-sounding instance was open.
+Confirmed this is a frequent real-world case, not a hypothetical: `twinkle.mid`'s
+first Harp track alone contains **85** overlapping same-pitch note pairs.
+
+**Fix**: added `App._active_note_counts: dict[int, int]`, tracking how many instances
+of each note are currently open. A shared `_apply_event(kind, note)` helper
+increments the count (and adds to `active_notes`) on note-on, decrements on note-off,
+and only removes the note from `active_notes` once its count reaches zero. `update()`
+and `_rebuild_active_notes()` (used by both live playback and `seek`/`seek_preview`)
+both route through this one helper instead of duplicating the add/discard logic;
+`_reset_playback()` clears the count dict alongside `active_notes`.
+
+**Verification**: added a direct trace against the real overlapping pair `twinkle.mid`
+actually contains (note 72, instances spanning 0.0–0.599s and 0.5–0.969s) — sampled
+`72 in app.active_notes` at several points via `seek_preview()` and confirmed it now
+stays `True` continuously from before the first instance starts through after the
+second instance ends (0.1s through 0.9s), with no premature drop at 0.6s (right where
+the old code would have cleared it when the first instance's note-off fired).
+
+**Regression tests added**: `tests/test_app.py` gained `ActiveNotesOverlapTest` (4
+tests) — drives `App._apply_event` directly (no file/engine needed) through the exact
+overlapping-instance and back-to-back-instance sequences the bug covers, an unrelated-
+notes-unaffected sanity check, and confirms `_reset_playback` clears the new counter
+dict.
+`python -m unittest discover -s tests -v` — **113/113 passing** (109 from before + 4
+new in `test_app.py`).
+
+### Bugfix 5: traditional view stuttered during playback ("freezes then jumps ahead")
+**Symptom**: watching a file play in the traditional view, the screen would
+occasionally freeze for a moment and then catch up, jumping ahead — described as
+jarring since it breaks the sense of the notation smoothly following the music.
+
+**Root cause**: `notation/glyphs.py`'s `GlyphAtlas.blit()` re-tinted a colored glyph
+from scratch on *every single call* — `glyph.surface.copy()` (a fresh `Surface`
+allocation) followed by a `BLEND_RGBA_MULT` fill — with no caching at all. Every
+notehead, accidental, rest, flag, and augmentation dot the traditional view draws
+passes a color, so a single busy frame could allocate and blend dozens of throwaway
+surfaces, 60 times a second. The *audio* clock (wall-clock, per Milestone 2's design —
+deliberately not paused by rendering) keeps advancing through any such hitch, so a
+frame that takes noticeably longer than its budget doesn't just render late — the next
+frame's `app.elapsed` has already moved forward by however long the hitch took,
+producing exactly the reported "freeze, then jump ahead" rather than a smooth
+slowdown. This is a real perf bug in code written this session, not present in the
+bars view (which never used `GlyphAtlas`).
+
+**Fix**: added a `_tint_cache: dict[(name, tier, color), Surface]` to `GlyphAtlas`,
+populated lazily the first time a given glyph/tier/color combination is drawn and
+reused on every subsequent call. The color set actually in play is small and
+theme-driven (a handful of RGB tuples per palette), so the cache stays small and
+bounded — confirmed empirically at 17-18 entries total across a whole file's worth of
+frames, dark and light theme both exercised.
+
+**Verification**: measured `TraditionalSlot.draw()` directly (bypassing the rest of the
+event loop) over 300 frames on `UndertaleMegalovania.mid`'s dense passage — median
+frame time dropped from 2.42ms to 1.92ms (~20% faster) and the worst-of-300 frame
+dropped from 3.44ms to 2.84ms. Re-rendered dark→light→dark on `MIDI C Major.mid` using
+the same `GlyphAtlas` instance across all three draws to confirm the cache doesn't leak
+stale colors across a theme switch (each render showed the correct theme's colors, no
+cross-contamination). Re-ran the full app-shell smoke test and a real-hardware
+`python main.py` launch — no regressions.
+
+**Regression tests added**: `tests/test_glyphs.py` (new) — asserts the cache behavior
+directly: repeating the same (name, tier, color) reuses one cache entry; a different
+color, or a different glyph name, each gets its own entry; an uncolored `blit()` (used
+for clefs against a fixed staff color, so effectively unused today but part of the
+public API) never touches the tint cache at all.
+`python -m unittest discover -s tests -v` — **109/109 passing** (105 from before + 4
+new in `test_glyphs.py`).
+
+Note: this fix reduces the *average* rendering cost and, more importantly, the amount
+of per-frame garbage generated (a likely contributor to intermittent GC-driven stutter
+beyond what a tight synthetic benchmark loop can fully reproduce, since the real app
+has audio/MIDI/other-slot activity running concurrently) — if any stutter is still
+noticeable after this fix, it's worth another report with a screen recording or a note
+of which file/zoom level triggers it, since there may be a second contributing factor
+(e.g. the per-frame `enumerate(engraving.notes)` tie-pairing loop, which currently
+walks the whole file's note list rather than just the visible window) not yet isolated.
+
+### Bugfix 4: stems (and everything else positioned off a notehead) used the wrong x-origin convention
+**Symptom** (reported with screenshots, after Bugfixes 2-3 were already in): stems
+still looked disconnected from their noteheads — not a gap this time, but the stem
+visibly cutting straight through the *middle* of the oval instead of attaching to its
+side, "doesn't look like actual notes." User included a reference image of correctly-
+engraved notation to clarify exactly what was wrong: real stems attach at the
+notehead's right edge (for stem-up notes) or left edge (stem-down), not its center.
+
+**Root cause**: a coordinate-convention mismatch introduced when the old hand-drawn
+renderer's stem/ledger-line/dot/tie formulas were ported over. The old
+`traditional_sheet.py` drew noteheads as polygons around a literal center point
+`(cx, cy)`, so `_stem_data`'s `note_x + notehead_w // 2` correctly reached the right
+edge (center + half-width). This session's `note_x` is computed the same way `bars.py`
+positions note rectangles — as the note's time-based **left** edge — and
+`GlyphAtlas.blit()` anchors noteheads at their own left edge too (all three notehead
+glyphs have `minx=0`), so blitting the notehead directly at `note_x` was actually
+correct *for the notehead itself*. But every formula ported from the old renderer
+(`_stem_data`, `_draw_ledger_lines`, `_draw_dots`, the tie-arc endpoints in the main
+`draw()` loop) still assumed `note_x` was the *center* — so `+ notehead_w // 2`
+computed the horizontal *center* of the glyph (left edge + half-width), not its right
+edge, and the stem was drawn straight through the middle of the (slanted, per Bravura's
+design) oval instead of tangent to its side. The giveaway that this was a real,
+pre-existing inconsistency (not something Bugfix 3 introduced): the accidental-
+placement code inside `_draw_chord_heads` and the tie-arc endpoints were *already*
+written assuming a center-based `note_x` — only the notehead blit itself and the
+`geoms` dict that fed everything else were on the left-edge convention.
+
+**Fix**: rather than auditing and re-deriving every individual offset formula, made
+`note_x` consistently mean "notehead center" from the single point where it's computed
+(in the geoms-building loop) onward — `note_x = left_x + notehead_w // 2`, where
+`left_x` is the original time-based left edge (kept, under that name, only for the
+off-screen culling check and the past/future color comparison, neither of which cares
+about a half-notehead-width difference). This makes every downstream formula that was
+already written for a center-based `note_x` (stems, ledger lines, dots, ties, beam
+groups) correct without touching them. The one place that *did* need a matching change
+is `_draw_chord_heads`'s notehead blit itself, which now shifts left by
+`notehead_w // 2` before blitting, since `GlyphAtlas.blit` still anchors at the glyph's
+own left edge — cancelling out the `geoms`-level shift so the notehead lands back at
+its correct on-screen position while everything measured *from* `note_x` is now
+correctly center-relative.
+
+**Verification**: built an isolated headless test (quarter, half, whole, and a 2-note
+chord, well-separated so none beam) and zoomed into the rendered PNG — stems now
+visibly terminate flush against the notehead's edge (right edge for these stem-up
+notes) rather than passing through its middle, for every note type tested including
+chords (a single stem serving two stacked noteheads, attached at the outer edge, as
+expected). Re-rendered `UndertaleMegalovania.mid`'s dense passage used in Bugfix 3's
+verification — every note now visibly connects to its stem correctly; the passage is
+still busy at default zoom (expected, per the density note in Bugfix 3/Milestone 4's
+Deviations) but no longer looks structurally broken.
+
+No regression test added — same reasoning as Bugfix 3 (pure glyph-offset geometry; a
+numeric assertion would just re-state the `notehead_w // 2` arithmetic). Verified via
+the headless isolated-note screenshot method, zoomed in enough to inspect the actual
+pixel-level stem/notehead junction rather than eyeballing a full page.
+`python -m unittest discover -s tests -v` — still 105/105 passing (no logic changed,
+only positioning math).
+
+### Bugfix 2: three real traditional-view rendering bugs, found via live testing
+**Symptoms** (reported across several messages, with screenshots): (1) horizontal
+"bars" rendered above the treble staff (and, less visibly, below the bass staff) that
+weren't tied to any actual note needing a ledger line — described as "especially bad"
+on dense 16th-note passages; (2) an individual notehead rendered with what looked like
+stray ledger-line fragments cutting through it, "doesn't look like a traditional note
+at all"; (3) with **all tracks unchecked** in the Tracks dropdown on `twinkle.mid`, the
+bass staff still showed rest glyphs — should have been completely empty.
+
+**Root causes** (three independent bugs, all in code written this session):
+
+1. **Ledger lines compared an absolute step against relative thresholds.**
+   `render/slots/traditional.py`'s `_draw_ledger_lines(surface, note_x, step, ...)`
+   decides whether a note needs a ledger line via `step <= -2` (below the staff) or
+   `step >= 10` (above it) — thresholds written for a step *relative to the staff's own
+   bottom line* (0 = bottom line, 8 = top line; same convention the old
+   `traditional_sheet.py` used). The call site was passing `n.pitches`' diatonic step
+   straight from `midi/spelling.py`, which is an *absolute* step (high 20s/30s/40s for
+   any real treble note, since it encodes octave too). Absolute steps are essentially
+   always `>= 10`, so **every note** — regardless of whether it was anywhere near the
+   staff — triggered the "needs a ledger line" branch. On a dense passage, many
+   overlapping short ledger-line stubs (each individually correctly *positioned*, just
+   wrongly *triggered*) chained together into what looked like continuous bars; on a
+   single note, the same bogus stubs are what looked like fragments cutting through the
+   notehead in the reported screenshot.
+2. **`EngravedRest` had no `track_id` at all.** `notation/engraver.py`'s `_find_rests`
+   already grouped rests by `(staff, track_id)` internally but discarded the track_id
+   (`for (staff, _track_id), spans in lanes.items():`) before constructing the
+   `EngravedRest` — so there was no field for the renderer to filter on, and
+   `render/slots/traditional.py`'s rest-drawing loop had no way to honor
+   `app.enabled_tracks` for rests the way it already did for notes. Muting every track
+   correctly hid all notes but left every rest rendered.
+3. **Notes/bars weren't clipped to the staff area** — `TraditionalSlot.draw()`'s
+   `screen.set_clip(...)` left edge was `rx` (the whole panel, including the clef box to
+   the left of `staff_x0`), not `staff_x0` itself. A note scrolled far enough left of the
+   playhead (`note_x < staff_x0`) was still inside that wider clip rect and could render
+   on top of the clef.
+
+**Fixes**:
+1. Re-base the step before calling `_draw_ledger_lines`: `step - ref_step` (where
+   `ref_step` is `TREBLE_REF_STEP`/`BASS_REF_STEP` for that note's staff), computed at
+   the actual call site rather than inside the function (the function's own thresholds
+   are correct for a relative step; the bug was purely in what the caller passed it).
+2. Added `track_id: int` to `EngravedRest`; `_find_rests` now keeps and passes it
+   through instead of discarding it as `_track_id`. `traditional.py`'s rest loop gained
+   `r.track_id not in enabled` alongside its existing staff check.
+3. Moved the clef glyph blits to *before* `screen.set_clip(...)` is applied, and
+   tightened the clip rect's left edge from `rx` to `staff_x0` — everything drawn after
+   that point (staff lines, measure lines, notes, ties, rests, playhead) is now clipped
+   to the staff area only; the clef box to its left is drawn once, outside the clip, and
+   can no longer be overdrawn by scrolled note content.
+
+**Verification**: re-rendered `UndertaleMegalovania.mid` headless after the ledger-line
+fix — the phantom bars above the treble staff are gone entirely, confirmed by visual
+diff against the pre-fix screenshot. Reproduced the user's exact "twinkle.mid, all
+tracks unchecked" scenario headless — bass staff (and treble) now render completely
+empty, no rests. Re-ran the full app-shell smoke test (`Dashboard`/`SlotManager`/
+`SheetSlot`, `twinkle.mid`, all four tracks enabled) and saved a full-window screenshot
+— no phantom bars, no notes overlapping the clef glyphs.
+
+**Regression tests added**: `tests/test_traditional_ledger_lines.py` (new) — drives
+`_draw_ledger_lines` directly against a real (headless) `pygame.Surface` and asserts
+pixel output: no lines drawn for relative steps within/just-outside the staff (4, 9),
+lines drawn for steps that actually need them (10, -2), plus one test that names the
+bug shape explicitly (passing an absolute step like 30 *does* wrongly draw a line,
+documenting the exact distinction the fix depends on). `tests/test_engraver.py` gained
+`test_rest_carries_the_track_id_of_its_lane`, asserting `EngravedRest.track_id` matches
+the source notes' track. No test added for the clipping fix — it's a pure rendering/
+compositing concern (pygame's clip rect), verified by the same headless-screenshot
+method as the other two.
+`python -m unittest discover -s tests -v` — **105/105 passing** (99 from Milestone 4 +
+1 new in `test_engraver.py` + 5 new in `test_traditional_ledger_lines.py`).
+
+### Bugfix 3: unbeamed eighth/sixteenth-note flags overlapped their own notehead
+**Symptom** (reported with a screenshot, after Bugfix 2's fixes were already in):
+"note head rendering is still quite broken" — flagged (unbeamed eighth/sixteenth) notes
+rendered with the flag glyph appearing to sit right on top of / wrap around the
+notehead itself, rather than hanging cleanly above or below it at the end of a visible
+stem.
+
+**Root cause**: `render/slots/traditional.py`'s `_stem_data()` defaulted unbeamed-note
+stem length to `LS * 2.2` (~53px at the app's fixed staff size). Measured the actual
+Bravura flag glyphs this session (`flag8thUp`/`flag8thDown`/`flag16thUp`/
+`flag16thDown` are all ~79px tall at this tier, ~3.3 staff-spaces — a normal SMuFL flag
+height, since a flag is designed to hang a specific distance down the stem it attaches
+to). A 53px stem is *shorter* than the 79px flag hanging from its tip, so the flag's
+notehead-ward end always overshot 26px past the stem's own base and rendered on top of
+the notehead — this was wrong for every single flagged note, not an edge case.
+
+**Fix**: raised the default stem length to `LS * 3.5` (~84px) — comfortably longer than
+the tallest flag glyph, matching standard engraving practice (a flagged note's stem is
+conventionally about the same length regardless of note value, sized to clear its
+flag). Beamed notes are unaffected — `_draw_beam_group` always passes its own explicit
+`stem_ext` (`LS * 2.5`), which this default never applies to.
+
+**Verification**: re-rendered isolated (non-adjacent, so unbeamed) eighth and sixteenth
+notes at both stem directions — flags now hang from a clearly visible stem, ending just
+short of the notehead rather than overlapping it. Re-checked against
+`UndertaleMegalovania.mid`'s dense passages: individual flagged notes look correct now;
+some visual crowding remains where an unbeamed note's flag (glyph width ~26-30px) sits
+close to a neighboring note only ~17px away in time at the default zoom — traced this
+to real (not buggy) tick-level beat bucketing: confirmed via a direct dump of
+`engraving.beam_groups` that adjacent eighth notes *do* pair up into beam groups
+whenever the data supports it (e.g. two eighths correctly filling one beat), and the
+remaining unbeamed notes are ones with no same-beat partner, which correctly get an
+individual flag per standard notation rules. This residual crowding is the same
+default-zoom density characteristic already noted in Milestone 4's Deviations (the
+app's existing Ctrl+scroll zoom addresses it) — not a new defect, and distinct from the
+flag/notehead overlap this fix actually corrects.
+
+No regression test added — this is pure glyph-geometry/spacing, the same category as
+Milestone 3's reset-icon-arrowhead bugfix (a numeric assertion would just re-encode the
+`LS * 3.5` constant rather than verify anything independent); verified via the headless
+isolated-note screenshot method instead.
+`python -m unittest discover -s tests -v` — still 105/105 passing (no logic changed,
+only a rendering constant).
+
+### Bugfix 1: inconsistent spacing between the dashboard's Bars/Traditional/Tracks buttons
+**Symptom** (reported with a screenshot): the gap between "Traditional" and "Tracks"
+was visibly smaller than the gap between "Bars" and "Traditional" — the two buttons
+looked like they were touching.
+
+**Root cause**: an arithmetic slip while adding the Bars/Traditional group in
+`render/dashboard.py`'s `Dashboard.__init__`. The layout convention (established in
+Milestone 3, confirmed by re-deriving it: New File→Open File is 50px apart within a
+group, Open File→Play has a 42px gap between groups) means a new *group*'s top should
+sit `BTN_H` (42px) past the previous group's bottom. Traditional's bottom is
+`y0+298+42 = y0+340`, so Tracks should start at `y0+340+42 = y0+382` — instead it was
+placed at `y0+340` (Traditional's bottom exactly), a copy-paste-arithmetic error that
+put zero gap between them instead of the intended 42px.
+
+**Fix**: `btn_tracks` moved from `y0+340` to `y0+382`; the third chrome separator moved
+from `pt+330` to `pt+372` (10px above Tracks' new top, matching the other two
+separators' 10-above-their-group convention). Verified via the same headless-screenshot
+method as the layout/icon bugfixes in Milestone 3 — cropped the dashboard region of a
+fresh render and visually confirmed the three button-group gaps now read as consistent.
+`python -m unittest discover -s tests -v` — still 99/99 passing (no test covers pixel
+layout, same reasoning as Milestone 3's analogous title-overlap bugfix).
 
 ## Post-Milestone-3 bugfixes (reported by user, fixed same session as reported)
 
@@ -221,6 +616,90 @@ despite exercising the real retry loop. 3 new tests.
 `python -m unittest discover -s tests -v` — 25/25 passing (22 from Bugfix 1 + 3 new).
 
 ## Completed milestones
+4 — Notation/transcription + sprite atlas. Done this session:
+- **`assets/fonts/Bravura.otf` + `OFL.txt`** (new, downloaded from
+  `steinbergmedia/bravura`'s `master` branch, SIL Open Font License) — see
+  Deviations for why this replaces Plan Part 3.3's planned hand-drawn/
+  commissioned `assets/glyphs/` SVG source entirely: `pygame.font.Font` loads
+  an arbitrary font *file* directly (not an OS-installed font by name), so
+  bundling a real SMuFL font sidesteps the old renderer's exact failure mode
+  (silently missing glyphs) without hand-authoring vector art at all.
+- **`tools/build_atlas.py`** (new) — offline pipeline: rasterizes a curated
+  29-glyph subset of Bravura (clefs, noteheads, accidentals, rests, flags,
+  augmentation dot, time-sig digits) at 3 fixed staff-space sizes (14/24/44px
+  — `sm`/`md`/`lg`) via `pygame.font.Font`, crops each tight (derived the
+  crop/anchor math from `Font.metrics()`/`get_ascent()` empirically — see the
+  module docstring), and packs them into one atlas. Run via
+  `python tools/build_atlas.py`; only needs re-running if the glyph list or
+  tier sizes change, not part of the app's runtime startup.
+- **`assets/atlas/glyphs.png` + `glyphs.json`** (new, generated + checked in)
+  — the packed sheet + manifest (`{tier: {glyph_name: {x,y,w,h,anchor_x,
+  anchor_y}}}`) `notation/glyphs.py` loads at runtime.
+- **`midivis/notation/glyphs.py`** (new) — `GlyphAtlas`: loads the atlas once,
+  `get()`/`blit()` by (name, tier) with a `color=` tint (glyphs are
+  rasterized white-on-transparent; tinting multiplies RGB while preserving
+  each pixel's own anti-aliased alpha). `nearest_tier()` exists for a future
+  per-DPI/zoom setting; the traditional view currently pins one fixed tier
+  (`'md'`) — see Deviations.
+- **`midivis/midi/quantize.py`** (new) — `classify_duration()` (duration in
+  beats -> note type + dots + triplet, via nearest log-ratio match over a
+  candidate table, replacing the old `_note_type`'s fixed-threshold
+  bucketing), `measure_ticks()`/`split_across_barlines()` (tie-across-barline
+  splitting), and `quantize_duration_ticks()` (snap a raw tick duration to a
+  16th-note grid before classifying — added mid-session after real sample
+  files showed *why* this is needed; see Deviations).
+- **`midivis/midi/spelling.py`** (new) — `spell(note, key_sig)`: key-
+  signature-aware enharmonic spelling. Fixes not just *which accidental
+  symbol* gets drawn (the literal bug Plan Part 2 calls out) but the deeper
+  version of it: which *staff position* a black key gets drawn at, since C#
+  and Db are the same pitch but sit on different lines. Scope is deliberately
+  bounded to single sharp/flat spelling (no double-accidentals) — see
+  Deviations.
+- **`midivis/notation/engraver.py`** (new) — `engrave()`: Timeline + TempoMap
+  -> `Engraving` (chords grouped by tick-tolerance per (staff, track) lane,
+  rests found from the gaps, ties split across barlines, notes bucketed into
+  beam groups), all in ticks-and-precomputed-seconds, no rendering. Adapted
+  from the plan's literal "laid-out glyph placements" framing since this
+  app's staff scrolls live (see the module docstring for why baking pixel
+  positions here would be wrong).
+- **`midivis/render/slots/traditional.py`** (new) — the grand-staff view:
+  `GlyphAtlas` blits for clefs/noteheads/accidentals/rests/flags/dots;
+  procedural `pygame.draw` for stems, primary+secondary beams, ledger lines,
+  staff lines, and (new — the old renderer never computed these) tie arcs.
+  Active/past/future note coloring and click-drag vertical scroll ported
+  from the old `traditional_sheet.py`'s equivalent behavior.
+- **`midivis/render/slots/sheet_slot.py`** (new) — the `app.view`-driven
+  dispatcher Milestone 3 deferred (`BarsSlot` was registered directly under
+  the `'sheet'` id since only one view existed yet).
+- **`midivis/app.py`** (grown) — `view: str = 'bars'`, `trad_scroll: float =
+  0.5`, `engraving: Engraving | None`, built once in `load()` (right after
+  `key_sig`/`time_sig` are known) via `engraver.engrave(...)` — not
+  recomputed per frame or per track-mute-toggle; `TraditionalSlot` filters
+  `app.engraving.notes`/`.rests` by `track_id in app.enabled_tracks` at draw
+  time instead, since chord/rest/beam grouping is already per-(staff,track)
+  lane and unaffected by which *other* tracks are muted.
+- **`midivis/render/dashboard.py`** (grown) — Bars/Traditional toggle
+  buttons (deferred from Milestone 3's "no view-mode toggle" scope note),
+  inserted between the Play/Reset row and the Tracks button; every button
+  below shifted down accordingly (Tracks now at `y0+382`, was `y0+248`) with
+  a third chrome separator added above Bars. (Tracks' offset was originally
+  miscalculated as `y0+340` — zero gap after Traditional — caught and fixed
+  same session; see Post-Milestone-4 bugfixes above.)
+- **`midivis/render/fonts.py`** (grown) — `measure_trad` font restored
+  (Milestone 3 dropped it as "traditional-notation-only").
+- **`midivis/render/theme.py`** (grown) — `trad_*` palette keys (background,
+  divider, staff/bar/playhead/measure-number/note colors) for both themes,
+  ported from the old `TraditionalSheetSlot._SLOT_COLORS`.
+- **`main.py`** — registers `SheetSlot()` in place of `BarsSlot()`; no other
+  changes.
+- `tests/test_spelling.py`, `tests/test_quantize.py`, `tests/test_engraver.py`
+  (all new) — pure-function unit tests per the Plan's Verification section.
+  38 new tests total.
+- Manually verified via headless rendering (see Test results below) —
+  real hardware `python main.py` smoke test only (no audio-path changes this
+  milestone, so no new hardware-specific behavior to verify beyond "still
+  launches cleanly").
+
 3 — UI shell + widgets + slots. Done this session:
 - `midivis/render/theme.py` (new) — one consolidated `THEMES` dict (dark/light) covering
   every UI surface: shared slot infra (handle/scrollbar), dashboard chrome, menu bar, and
@@ -476,12 +955,17 @@ despite exercising the real retry loop. 3 new tests.
   them as-is rather than re-copying.
 
 ## In progress / partially done this session
-(none — Milestone 3 fully complete: widgets, theme, SlotManager with both bugs fixed,
-all four slots, the dashboard, the new `main.py` shell, and the `midi/` metadata modules
-it needs (`load.py`/`channel_remap.py`/`analyze.py`/`instruments.py`) are all done,
-unit-tested, and manually verified against real FluidSynth hardware. Traditional
-notation, recording, MIDI input/hardware, and the sequencer backend are deliberately
-untouched — Milestones 4 onward.)
+(none — Milestone 4 fully complete: quantize.py, spelling.py, the glyph atlas pipeline
+(font asset + build tool + generated atlas + runtime loader), the engraver, the
+traditional grand-staff view, the view-toggle dashboard buttons, and the sheet_slot.py
+dispatcher are all done, unit-tested where the logic is pure, and manually verified via
+headless rendering against several real sample files plus one real-hardware
+`python main.py` launch. Recording, MIDI input/hardware, per-device input routing, and
+the sequencer backend are deliberately untouched — Milestones 5 onward. One open item
+carried forward, not a partial-completion: the Plan Part 3.3 open question about
+hand-drawn/commissioned art vs. restyling a SMuFL font was resolved by adopting stock
+Bravura unrestyled — see Deviations for why restyling itself (toward the rounder/
+weightier look) is out of scope for this session specifically, not abandoned.)
 
 ## Decisions made or deviations from the plan
 - **`AudioEngine.load()` takes `(midi_bytes, tempo_map)`, not just `midi_bytes`** as
@@ -576,6 +1060,118 @@ untouched — Milestones 4 onward.)
   (Milestone 2 loads bytes directly into the FluidSynth player, same as the old
   `engine.load_from_mem()` path, so it doesn't need `Timeline` populated either).
 
+### Milestone 4 deviations
+
+- **Glyph source is a bundled real SMuFL font (Bravura.otf), not hand-authored SVG.**
+  Plan Part 3.3 names `assets/glyphs/` SVG source rasterized by
+  `tools/build_atlas.py`, with an explicit "not blocking" open question: hand-draw/
+  commission original art, or start from an open-license SMuFL font (Bravura is named
+  directly) and restyle it. Discovered mid-session that `pygame.font.Font(path, size)`
+  loads a font *file* directly — no OS font-name lookup at all — so downloading
+  Bravura.otf (SIL OFL 1.1, confirmed via `steinbergmedia/bravura`'s own `redist/OFL.txt`,
+  copied alongside it) and rasterizing specific codepoints via pygame at build time gets
+  every architectural goal Part 3.3 wants (offline pipeline, no runtime OS-font
+  dependency, no silent-omission failure mode) without writing a single Bezier curve by
+  hand. The *restyling* half of the open question (toward the rounder/weightier
+  SimplyPiano/Flowkey look) is genuinely not done — this session shipped stock Bravura,
+  which looks like conventional engraved notation, not the reference screenshots' softer
+  style. Restyling a font requires font-editing tooling (e.g. FontForge scripting) beyond
+  what a build-time rasterizer can do; worth a dedicated look in Polish (Milestone 8) or
+  whenever the visual style is being revisited, not blocking anything downstream since
+  `notation/glyphs.py`'s interface (name+tier -> bitmap+anchor) doesn't care what font
+  backs it.
+- **`assets/glyphs/` (SVG source) and the SVG-rasterization step in Part 3.3's tree don't
+  exist** — direct consequence of the above. `assets/fonts/Bravura.otf` (+ `OFL.txt`) is
+  the source now; `assets/atlas/` (generated PNG + JSON manifest) is unchanged from the
+  plan's own naming.
+- **Only one glyph size tier is actually used at runtime** (`'md'`, 24px staff-space),
+  though `build_atlas.py` generates three (`sm`=14, `md`=24, `lg`=44). Confirmed by
+  re-reading the old `traditional_sheet.py` that staff size there was a fixed constant
+  (`LS = 20`) never tied to `app.sheet_zoom` (zoom only ever affected horizontal note
+  spacing/time scale, both there and in `bars.py` — resizing/zooming the panel changes
+  how much *time* is visible or how much vertical *range* you can scroll to, not the
+  staff's own size), so there's currently no zoom axis in this app that a mid-frame
+  tier-switch would even respond to. Picked `'md'` specifically so it needs zero runtime
+  rescaling (`LS = 24` in `traditional.py` matches the tier's staff-space size exactly).
+  The other two tiers exist for a plausible future per-DPI or staff-zoom setting to pick
+  from without rebuilding the atlas — not dead code, just not wired to anything yet.
+- **`midi/quantize.py`'s "grid + strength" recording-quantization function (Plan Part
+  3.2's sidebar) is NOT built this milestone** — confirmed correct scope reading Plan
+  Part 4's milestone list: that's explicitly named under Milestone 5 ("recording
+  quantization... fixes unaligned bars from live-played timing"), and there's no
+  `recorder.py`/live-recording workflow yet for it to plug into or be tested against.
+  What *is* built this milestone (`classify_duration`/`measure_ticks`/
+  `split_across_barlines`) is the other half Plan Part 3.2 names in the same breath:
+  "rhythm quantization... duration -> (type, dots, tuplet)... tie-generation across
+  barlines" — the notation-display half, which the engraver needs regardless of whether
+  recording exists yet.
+- **`quantize_duration_ticks()` (new, not explicitly named in the plan) was added
+  mid-session** after rendering real sample files (`midiTracks/MIDI C Major.mid`,
+  `twinkle.mid`) showed *why* it's needed: real (non-machine-quantized) MIDI files
+  routinely encode note durations a handful of ticks short of the "intended" value (a
+  note released slightly early, or arpeggiator/DAW-exported timing) — feeding that raw
+  duration straight into `classify_duration` snapped to the nearest *exact* ratio and
+  regularly misclassified plain eighth notes as double-dotted sixteenths or triplets,
+  purely from a handful of ticks of real-world imprecision. Snapping to a sixteenth-note
+  grid *before* classifying (this function) eliminates that jitter for realistic files
+  while leaving `classify_duration` itself exact and independently testable. This is
+  display-only — it never touches `note_events`/playback timing, only which glyph gets
+  drawn — so it's a different thing from Milestone 5's recording-quantization (which
+  writes quantized ticks back into saved note data with an adjustable strength dial).
+  Files with genuinely loose/expressive timing (confirmed on `MIDI C Major.mid`, which
+  is not machine-quantized) will still show occasional odd dotted-note classifications
+  even after this fix — a real, inherent limit of classifying arbitrary real-world
+  durations against a fixed candidate table, not something achievable to fully solve
+  with a single default grid choice. Not chased further this session; visually confirmed
+  acceptable on every sample file tried.
+- **`midi/spelling.py`'s scope is single sharp/flat only, no double-accidentals** — a
+  key is classified as sharp- or flat-flavored (via a direct port of mido's own
+  key-signature name→accidental-count table, not re-derived from pitch class — see the
+  module's docstring for why re-deriving it is actually wrong, not just redundant: C#
+  major (7 sharps) and Db major (5 flats) share a pitch class but are different, both-
+  valid key names that a naive "fewest accidentals" fold would silently conflate) and
+  *all twelve* pitch classes in that key use the corresponding sharp or flat table. This
+  is exact for every key's own diatonic scale tones (by construction) and a reasonable,
+  consistent default for chromatic passing tones — not full harmonic-function spelling.
+  Verified this is a real fix, not just cosmetic, via
+  `test_staff_position_differs_for_enharmonic_spellings`: C#4 and Db4 (same MIDI note)
+  now land on genuinely different staff positions, which is the actual bug (the old
+  renderer's `_DIAT` table always used C's position regardless of key).
+- **Voice/staff assignment is still the old pitch >= 60 threshold** — Plan Part 3.2 says
+  this "becomes a per-track/channel property (with pitch-based default)"; only the
+  default half is built (`engraver.default_staff_of`, a named, swappable function rather
+  than an inline literal scattered through the renderer, per the same section's framing).
+  Per-track/channel staff configuration needs UI/settings scope not otherwise in this
+  milestone's list; `engrave()`'s `staff_of` parameter exists specifically so a future
+  settings-driven version is a one-line change at the call site in `app.py`, not a
+  rewrite of the engraver.
+- **Real sample files surfaced a genuine engraver bug during manual verification, fixed
+  same session**: `traditional.py`'s stem-direction helper (`_group_stem_up`) compared
+  each note's *absolute* diatonic step against a bare constant (`<= 4`, ported from the
+  old `traditional_sheet.py`'s equivalent check without noticing the old code compared a
+  step already made *relative to the staff's bottom line*, not an absolute one) — since
+  every real treble note's absolute step is in the high-20s/30s, this made literally
+  every stem in the app point the same direction regardless of pitch. Caught by
+  rendering `midiTracks/MIDI C Major.mid` (a rising scale) and noticing all stems still
+  pointed down. Fixed by adding `_MIDDLE_STEP = {'treble': TREBLE_REF_STEP + 4, 'bass':
+  BASS_REF_STEP + 4}` (absolute step of each staff's own middle line) and threading the
+  correct one through every call site (`_draw_chord`, `_draw_beam_group`, the tie-arc
+  direction check). No unit test added for this specifically — it's a rendering-only
+  concern verified by the same headless-screenshot method as Milestone 3's icon/layout
+  bugfixes (see Test results below); a numeric assertion here would just re-encode the
+  same threshold arithmetic it's meant to verify.
+- **Beam/tie/stem rendering was verified correct via isolated synthetic-note headless
+  renders**, not just by eyeballing dense real files: real sample files at the app's
+  default 8-measures-visible zoom produce enough note density (especially
+  `UndertaleMegalovania.mid`'s ~230 BPM sixteenth runs and `twinkle.mid`'s 4-track
+  doubled arrangement, both intentionally busy files) that overlapping noteheads/stems/
+  ties made it genuinely hard to tell correct-but-crowded apart from actually broken by
+  eye alone. Isolated two-note and four-note synthetic `NoteEvent` lists (throwaway
+  scripts, not checked in) confirmed beams, secondary (16th-note) beams, and tie arcs
+  are all geometrically correct once instead rendered without that crowding — the
+  visual density in busy real files is real crowding at default zoom (the app's existing
+  Ctrl+scroll zoom control addresses this already), not a rendering defect.
+
 ### Milestone 3 deviations
 
 - **Resolved the previous session's channel-remap ambiguity**: `midi/channel_remap.py` is built
@@ -632,6 +1228,126 @@ untouched — Milestones 4 onward.)
   (no more "whichever of the left/right column is taller" — just the left column's fixed row count).
 
 ## Test results from this session
+- `python -m unittest discover -s tests -v` — **99/99 passing**: 61 carried forward
+  unchanged (Milestones 1-3 + post-M3 bugfixes) + 38 new (`test_spelling.py`: 10,
+  `test_quantize.py`: 16, `test_engraver.py`: 12).
+- **Atlas build verified visually**: ran `python tools/build_atlas.py`, composited the
+  generated `glyphs.png` onto an opaque background and inspected it — all 29 glyphs
+  present and legible across all 3 tiers (clefs, noteheads, accidentals, rests, flags,
+  digits), no missing/blank cells.
+- **`GlyphAtlas` smoke-tested headless** (`SDL_VIDEODRIVER=dummy`): loads the generated
+  atlas, `nearest_tier()`/`get()`/`blit()` (including the `color=` tint path) all work
+  without error.
+- **Traditional view rendered headless against multiple real sample files** (throwaway
+  scripts, not checked in — construct a real `App`, load an actual file, call
+  `TraditionalSlot.draw()` onto a real `pygame.Surface`, save as PNG, view it):
+  - `midiTracks/twinkle.mid` (4 tracks, doubled Harp+Piano arrangement) — confirmed
+    clefs/staff/measure numbers render; flagged as *very* dense at default zoom, which
+    led to isolating single tracks for clearer verification (see below), not a rendering
+    defect (see Deviations).
+  - `midiTracks/MIDI C Major.mid` (single track, simple rising scale) — this is where
+    the stem-direction bug (see Deviations) was actually caught: every stem pointed the
+    same direction regardless of pitch, obviously wrong for a rising scale. Re-rendered
+    after the fix — stems now correctly flip direction around the staff's middle line.
+    Also where `quantize_duration_ticks()` was added, after noticing spurious dotted-note
+    classifications on this file's slightly-imprecise real durations.
+  - `midiTracks/UndertaleMegalovania.mid` (3 tracks, D minor/1 flat, ~230 BPM) — confirmed
+    flat-key accidentals render correctly (the piece's Bb key signature), and confirmed
+    past/active/future note coloring (gray/red/blue) matches the bars view's scheme.
+  - Both dark and light themes checked for each file — `trad_*` palette re-themes fully,
+    no un-themed literals left over.
+  - Isolated synthetic-note renders (two eighth notes, four sixteenth notes, a note tied
+    across a barline) confirmed beams, secondary beams, and tie arcs are geometrically
+    correct in a low-density scene, isolating that from real files' visual crowding.
+- **Full app shell smoke test** (headless, real `App`/`Dashboard`/`SlotManager`/
+  `SheetSlot` objects, `twinkle.mid` loaded): rendered the Bars view, simulated a click
+  on the dashboard's Traditional button (confirmed `app.view` flips and the traditional
+  view renders with no exception), clicked back to Bars, then ran a few `app.update()` +
+  render frames in Traditional view with a seeked-forward position — no exceptions
+  across the whole sequence. Saved a full-window screenshot: dashboard chrome (all
+  buttons/separators), timeline, traditional notation, and the on-screen keyboard's
+  active-note highlighting all agreed with each other (same notes highlighted red in
+  both the score and the keyboard).
+- **`python main.py` against real FluidSynth hardware**: launched cleanly, same benign
+  `wasapi: requested mode cannot be fully satisfied` console line as every prior
+  milestone, no traceback, `timeout 6 python main.py` exit code 124 (killed by timeout
+  after a healthy run, not a crash). No audio-path code touched this milestone, so this
+  is a regression check, not new-behavior verification.
+- `git status` — exactly the files listed under "Files touched" above (Completed
+  milestones, Milestone 4 entry) are new/modified; nothing stray, no leaked
+  `__pycache__`.
+
+### Manual test steps for you to run
+1. `python -m unittest discover -s tests -v` — should show 99/99 passing.
+2. `python main.py`, then **File > Open...** a file from `midiTracks/` (e.g.
+   `UndertaleMegalovania.mid` or `MIDI C Major.mid` for something visually simpler).
+3. Click the dashboard's **Traditional** button (next to **Bars**, below Play/Reset) —
+   the sheet view switches from the piano-roll to a grand staff with a treble and bass
+   clef, staff lines, and notation. Click **Bars** to switch back — confirm both views
+   keep working after switching back and forth a few times.
+4. **Play** (or Space) while in Traditional view — notes should scroll past the
+   playhead, ties should show as small curved arcs connecting notes that cross a
+   barline, and the currently-sounding note(s) should highlight in the same color as the
+   bars view's active-note color, matching what lights up on the on-screen keyboard
+   below.
+5. **Uncheck a track** in the Tracks dropdown while in Traditional view — that track's
+   notes/rests disappear from the staff (same per-track mute the bars view already has).
+6. Try a file with a non-C-major key signature (e.g. `UndertaleMegalovania.mid`, D
+   minor/1 flat) — accidentals should show as flats (♭), not sharps; try one with sharps
+   too if you have one — confirm the accidental symbol and *which line/space the note
+   sits on* both look right (this is the specific bug Milestone 4 fixes — the old app
+   always drew '#' and always used the sharp-key staff position regardless of the file's
+   actual key).
+7. **Ctrl+scroll and plain-scroll over the traditional view** — same zoom/vertical-scroll
+   behavior as the bars view (they share the same event/zoom plumbing via `SheetSlot`).
+8. **View > Color Theme > Light** while in Traditional view — staff, clefs, notes,
+   playhead, measure numbers should all re-theme (no leftover dark-only literals).
+9. Load a file with fast/dense passages (e.g. `UndertaleMegalovania.mid`) and zoom in
+   (Ctrl+scroll) on a busy section — individual noteheads/stems/beams should become
+   legible as you zoom in, confirming the crowding at default zoom is a zoom/density
+   issue, not broken geometry (see Deviations for the manual verification already done
+   on this point).
+10. Quit via Esc — clean exit, no traceback.
+
+## Notes for the next session
+Start Milestone 5 (Recording + MIDI input) per `FullRewritePlan.md` Part 4 and Part
+3.2/3.6/3.7: tempo-map-aware `midi/recorder.py` (replacing the old single-tempo-frozen-
+at-arm() `MidiRecorder`), recording quantization (grid + strength — the *other* half of
+Plan Part 3.2's quantization sidebar that this session deliberately deferred; see this
+session's Deviations for exactly why it wasn't built yet and what it needs:
+`midi/quantize.py`'s existing `classify_duration`/`split_across_barlines` are already
+there for it to reuse, it just needs a new grid-snap-with-strength function operating on
+recorded ticks directly, plus the actual recorder to call it from), persistent-process
+MIDI device enumeration (replacing the fresh-subprocess-per-poll model — packaging
+landmine called out in Plan Part 2), hardware sustain-pedal (CC64) live passthrough
+parity with the computer-keyboard path, channel-remap edge-case fixes (>15 melodic
+tracks, multiple simultaneous drum tracks — `midi/channel_remap.py`'s module docstring
+already flags these as the deliberately-deferred gaps from Milestone 3), per-device-
+per-channel input routing (`input/manager.py`, replacing the half-built `ChannelAction`
+model), and drum pad input + a new `render/slots/drum_pad.py` view.
+
+Reference material in the old `MidiVis` repo for Milestone 5: `midi_recorder.py` (the
+whole `MidiRecorder` class — arm/record/save state machine, the `.work`-file safety
+copy pattern) and `midi_input.py` (subprocess-isolated USB enumeration, the
+`ChannelAction` model, sustain-pedal handling for the computer-keyboard path to mirror
+for hardware input). `midi_instruments.GM_DRUM_NOTE_NAMES` (already ported to
+`midivis/midi/instruments.py` in Milestone 3) is the source for the default GM drum-pad
+mapping Plan Part 3.6 calls for.
+
+`render/widgets/text_input.py`'s `TextInput` (built in Milestone 3, unused since then)
+is specifically for this milestone's record-arm panel — use it directly rather than
+re-rolling cursor/editing logic.
+
+Nothing from Milestone 4 is left in a partial state — no cleanup needed before
+starting. `app.engraving` (built once in `App.load()`) and `midi/quantize.py`/
+`spelling.py` should be kept and built on, not rebuilt — the recorder's quantization
+needs the same tick-domain math `quantize.py` already has, and any future notation
+polish should extend `notation/engraver.py` rather than duplicate its chord/rest/beam
+grouping elsewhere.
+
+---
+
+## Test results from Milestone 3 (previous session)
 - `python -m unittest discover -s tests -v` — **58/58 passing**: 25 carried forward
   unchanged (Milestones 1-2 + the two post-M2 bugfixes) + 6 new in `test_app.py`
   (track mute, keyboard passthrough, seek-preview) + 27 across four new files
@@ -666,92 +1382,7 @@ untouched — Milestones 4 onward.)
 - `git status` — exactly the files listed under "Files touched" above are new/modified;
   nothing stray, no leaked `__pycache__`.
 
-### Manual test steps for you to run
-1. `python -m unittest discover -s tests -v` — should show 61/61 passing (58 from this
-   milestone + 3 from the post-milestone Shift-sustain bugfix above).
-2. `python main.py` — window opens at 1200×720 titled "MidiVis": menu bar (File, View)
-   at the top, dashboard panel on the left (New File/Open File/Play/Reset/Tracks
-   buttons), and the timeline/bars/keyboard/properties slot stack filling the rest.
-3. **File > Open...**, pick a file from `midiTracks/` (e.g. `twinkle.mid`) — dashboard's
-   Play/Reset/Tracks buttons enable, the bars view fills with note rectangles, the
-   properties bar shows the filename + key/time-sig/tempo.
-4. **Space** or the dashboard's **Play** button — audible playback starts, notes light
-   up in the bars view and the on-screen keyboard as they play, the timeline fills.
-5. **Click the Tracks button** — dropdown opens with All/None + one row per track
-   (drum tracks, if any, grouped below a "Drums" separator). **Uncheck a track** — its
-   notes disappear from the bars view and go silent (audible if it was actively
-   sounding); re-check it to confirm both come back. Click **All**/**None** to confirm
-   the bulk toggles work and update the "N/M tracks" hint under the button.
-6. **Drag the timeline bar** while playing — should scrub smoothly (position preview
-   follows the mouse without any audio glitching *during* the drag itself), then resume
-   playing from the released position, not the pre-drag one. Try it again while paused —
-   should hold at the released position and start from there when you press Space (this
-   exercises the `seek_preview()`/`seek()` split called out in Deviations above — worth
-   testing carefully since it's a real design change, not a straight port).
-7. **Click and drag a key on the on-screen keyboard** — should sound a preview note
-   (bypassing track mute) and highlight; **Shift+click** a key to latch/sustain it,
-   click again to release. Then **Shift+click two or three different keys** (latching
-   each) and **release the Shift key** (not click anything) — all of them should cut
-   off immediately. This is the post-milestone bugfix above; before it, releasing
-   Shift did nothing and each note stayed stuck on until individually re-clicked.
-8. **Ctrl+scroll over the bars view** — zooms in/out (fewer/more measures visible).
-   **Plain scroll over the bars view** — scrolls the note-lane strip up/down.
-   **Shift+scroll or a horizontal trackpad swipe** over the bars view — nudges playback
-   position forward/back.
-9. **Drag a slot's handle strip** (the narrow grip on the left edge of each panel) to
-   reorder the stack — e.g. drag Properties above Bars — confirm the new order sticks
-   and that clicking within each panel still hits the right one (this exercises the
-   click-priority-vs-visual-order fix).
-10. **View > Slots**, uncheck one (e.g. Keyboard) — that panel disappears and the
-    flexible bars view grows to fill the space; re-check it to bring it back.
-11. **View > Color Theme > Light** — every panel (dashboard, menu bar, track dropdown,
-    all four slots) should re-theme, including the track dropdown, which the old app
-    left stuck in dark colors under Light theme (Plan Part 2's called-out bug — confirm
-    it's actually fixed here, not just structurally themed).
-12. **Resize the window** (drag an edge/corner) — panels reflow; shrinking narrow/short
-    enough should not crash (there's a `MIN_WIN_W`/`MIN_WIN_H` floor).
-13. Quit via **Esc** or the window's close button — clean exit, no traceback, no
-    orphaned `python.exe` holding the audio device afterward.
-14. **Regression check**: confirm play/pause/seek still behave exactly as Milestone 2's
-    hardware testing established (no regressions from moving those code paths under the
-    new UI) — the "seek while paused: audio may click for one frame" known issue is
-    still expected and unchanged.
-
-## Notes for the next session
-Start Milestone 4 (Notation/transcription + sprite atlas) per `FullRewritePlan.md`
-Part 4 and Part 3.3/3.2: `quantize.py` (rhythm quantization — duration → type/dots/
-tuplet, tie-across-barline), `spelling.py` (key-signature-aware enharmonic spelling),
-the glyph atlas pipeline (`assets/glyphs/` SVG source, `tools/build_atlas.py`,
-`notation/glyphs.py`'s `GlyphAtlas`), `notation/engraver.py` (Timeline + TempoMap →
-laid-out glyph placements, pure/no rendering), and the traditional grand-staff view
-built on top of it. Per Plan Part 3.3, there's an explicit open question worth a quick
-spike before committing: hand-drawn/commissioned glyph art vs. restyling an
-open-license SMuFL font (e.g. Bravura) toward the rounder/weightier SimplyPiano/Flowkey
-look — not blocking, but decide early since it shapes the whole atlas pipeline.
-
-This is also where `app.view` and a `render/slots/sheet_slot.py` dispatcher (picking
-between `BarsSlot` and the new traditional slot) need to be introduced — Milestone 3
-deliberately skipped both since there was only one view to dispatch to (see this
-session's Deviations). `BarsSlot` currently registers directly as the `'sheet'` slot id
-in `main.py`; that wiring is what needs to change to go through the new dispatcher
-instead, not `BarsSlot` itself.
-
-Reference material in the old `MidiVis` repo for Milestone 4: `ui/slots/
-traditional_sheet.py` (596 lines — the live grand-staff renderer; `ui/slots/
-midi_sheet_traditional.py` is the confirmed-dead pre-refactor leftover, don't use it)
-for the overall layout algorithm (staff positioning, stem/beam/ledger-line drawing,
-voice/staff assignment), but per Plan Part 3.3 the specific pieces to *replace* rather
-than port are: the OS-font clef lookup (silently disappears if `segoeuisymbol` lacks
-the glyphs — Plan Part 2's called-out failure mode), the literal-`'#'`-character
-accidentals (always sharp, ignores `app.key_sig`), and the hand-drawn Bézier rests.
-Keep stems/beams/ledger-lines/staff-lines procedural per Part 3.3 — they already look
-fine and are naturally resolution-independent.
-
-Nothing from Milestone 3 is left in a partial state — no cleanup needed before
-starting. `App.timeline`/`note_events`/`track_channels`/`instruments` and the
-`midi/load.py`/`channel_remap.py`/`analyze.py` modules from this session should be
-kept and built on, not rebuilt — the notation engraver consumes the same `Timeline`
-the bars view already does.
+Nothing from Milestone 3 was left in a partial state at the start of Milestone 4.
 
 ---
 

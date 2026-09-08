@@ -15,6 +15,7 @@ def get_fonts() -> dict:
         _fonts['normal_bold'] = pygame.font.SysFont('segoeui', 14, bold=True)
         _fonts['small'] = pygame.font.SysFont('segoeui', 11)
         _fonts['measure_bars'] = pygame.font.SysFont('segoeui', 14)
+        _fonts['measure_trad'] = pygame.font.SysFont('segoeui', 14)
     return _fonts
 
 

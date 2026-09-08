@@ -26,6 +26,15 @@ _DEFAULTS = {
         'fluidsynth_bin': '',  # folder containing libfluidsynth-3.dll
         'soundfont': '',       # path to a .sf2 file
     },
+    'notation': {
+        # "Note accuracy threshold" for the traditional view: snap each
+        # note's onset/release to the nearest 1/N note before engraving, so
+        # ordinary performance timing noise (a note released a touch late,
+        # a slightly-early legato attack) doesn't read as a spurious
+        # overlap or gap in the printed page. 0 disables snapping (exact
+        # MIDI timing). See midi/quantize.py's snap_note_span.
+        'snap_grid': 32,
+    },
 }
 
 

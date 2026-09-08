@@ -29,6 +29,9 @@ from midivis.midi import analyze
 from midivis.midi import channel_remap
 from midivis.midi import load as midi_load
 from midivis.midi.model import TempoMap, Timeline
+from midivis.midi import quantize
+from midivis.notation import engraver
+from midivis.notation.engraver import Engraving
 
 
 class App:
@@ -61,6 +64,12 @@ class App:
         self._flat_events: list[tuple[float, int, int, int]] = []
         self._event_index = 0
         self.active_notes: set[int] = set()
+        # How many currently-open instances of each note are sounding.
+        # active_notes alone can't tell two overlapping/back-to-back
+        # instances of the *same* pitch apart from one instance -- see
+        # _apply_event's docstring for why that's a real bug, not a
+        # hypothetical one.
+        self._active_note_counts: dict[int, int] = {}
 
         self._preview_elapsed: float | None = None
 
@@ -70,6 +79,17 @@ class App:
         self.sheet_zoom: float = 1.0
         self.bars_scroll: float = 0.0
         self.properties_expanded: bool = False
+
+        self.view: str = 'bars'
+        self.trad_scroll: float = 0.5
+        self.engraving: Engraving | None = None
+        # "Note accuracy threshold" for the traditional view (user-facing
+        # setting: settings['notation']['snap_grid']) — see
+        # midi/quantize.py's snap_note_span for what this actually does.
+        # main.py sets this from settings before the first load(); changing
+        # it afterward goes through set_notation_snap_grid() so the current
+        # file's notation re-engraves without a full reload.
+        self.notation_snap_grid: int = quantize.DEFAULT_SNAP_GRID
 
     @property
     def loaded(self) -> bool:
@@ -111,6 +131,10 @@ class App:
         self.measure_times = midi_load.build_measure_times(
             self.bpm, self.time_sig[0], self.total_dur)
 
+        self.engraving = engraver.engrave(
+            self.timeline.note_events, self.tempo_map, self.time_sig, self.key_sig,
+            grid_denominator=self.notation_snap_grid)
+
         self._preview_elapsed = None
         self._reset_playback()
         self.kb_notes = set()
@@ -123,6 +147,19 @@ class App:
             self.engine.load(mid_bytes, self.tempo_map)
             self._update_track_muting()
         return True
+
+    def set_notation_snap_grid(self, grid_denominator: int) -> None:
+        '''Change the traditional view's "note accuracy threshold" and
+        re-engrave the current file immediately (if one is loaded) — a menu
+        toggle should take effect right away, not just on the next file
+        open. Cheap enough to do synchronously: engraving one file is a
+        one-shot pass over its notes, not a per-frame cost.
+        '''
+        self.notation_snap_grid = grid_denominator
+        if self.timeline is not None:
+            self.engraving = engraver.engrave(
+                self.timeline.note_events, self.tempo_map, self.time_sig, self.key_sig,
+                grid_denominator=self.notation_snap_grid)
 
     # ------------------------------------------------------------------
     # Playback
@@ -189,15 +226,44 @@ class App:
                and self._flat_events[self._event_index][0] <= elapsed):
             _, kind, note, track_id = self._flat_events[self._event_index]
             if track_id in self.enabled_tracks:
-                if kind == 0:
-                    self.active_notes.add(note)
-                else:
-                    self.active_notes.discard(note)
+                self._apply_event(kind, note)
             self._event_index += 1
+
+    def _apply_event(self, kind: int, note: int) -> None:
+        '''Update active_notes for one on/off event, tracking a per-note
+        open-instance count rather than a bare boolean.
+
+        A single track can absolutely retrigger the same pitch before its
+        previous sounding has ended (legato/overlapping releases in a real
+        performance, or two note-on events for the same note whose note-offs
+        arrive out of the "obvious" order) — midi/load.py's
+        _events_to_notes already models this correctly with a FIFO per
+        (note, channel, track), producing two overlapping/back-to-back
+        NoteEvents for the same pitch. But a plain `set[int]` can't
+        represent "two instances of note 60 are open" as anything other
+        than "note 60 is open" — so the first instance's note-off call
+        (`discard`) incorrectly turned the note off even while a second,
+        still-sounding instance was in progress (reported: notes losing
+        their highlight before the note actually ends, or a stale highlight
+        outliving what the bars view drew for it). Counting open instances
+        per note fixes this: the note only leaves active_notes when its
+        count reaches zero.
+        '''
+        if kind == 0:
+            self._active_note_counts[note] = self._active_note_counts.get(note, 0) + 1
+            self.active_notes.add(note)
+        else:
+            remaining = self._active_note_counts.get(note, 0) - 1
+            if remaining <= 0:
+                self._active_note_counts.pop(note, None)
+                self.active_notes.discard(note)
+            else:
+                self._active_note_counts[note] = remaining
 
     def _reset_playback(self) -> None:
         self._event_index = 0
         self.active_notes = set()
+        self._active_note_counts = {}
 
     def _sync_event_index(self) -> None:
         '''Recompute _event_index to match the current elapsed after a
@@ -210,15 +276,13 @@ class App:
 
     def _rebuild_active_notes(self) -> None:
         self.active_notes = set()
+        self._active_note_counts = {}
         for t, kind, note, track_id in self._flat_events:
             if t > self.elapsed:
                 break
             if track_id not in self.enabled_tracks:
                 continue
-            if kind == 0:
-                self.active_notes.add(note)
-            else:
-                self.active_notes.discard(note)
+            self._apply_event(kind, note)
 
     # ------------------------------------------------------------------
     # Track list / mute
