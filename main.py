@@ -19,9 +19,10 @@ from midivis import settings as cfg
 from midivis.app import App
 from midivis.audio import setup as audio_setup
 from midivis.audio.fluid_player import FluidPlayerBackend
+from midivis.midi import quantize
 from midivis.render import fonts as fonts_mod
 from midivis.render.dashboard import Dashboard
-from midivis.render.slots import BarsSlot, KeyboardSlot, PropertiesSlot, SlotManager, TimelineSlot
+from midivis.render.slots import KeyboardSlot, PropertiesSlot, SheetSlot, SlotManager, TimelineSlot
 from midivis.render.theme import get_theme
 from midivis.render.widgets.menu import MenuBar, MenuItem, TopMenu
 
@@ -75,11 +76,13 @@ def run() -> None:
         print(f'FluidSynth init failed: {e}')
 
     app = App(engine)
+    app.notation_snap_grid = user_settings.get('notation', {}).get(
+        'snap_grid', quantize.DEFAULT_SNAP_GRID)
 
     dashboard = Dashboard(left_w=LEFT_W, menu_h=MENU_H)
     slot_manager = SlotManager([
         TimelineSlot(),
-        BarsSlot(),
+        SheetSlot(),
         KeyboardSlot(),
         PropertiesSlot(),
     ])
@@ -102,6 +105,7 @@ def run() -> None:
         return [
             MenuItem('theme', 'Color Theme', submenu_fn=_theme_items),
             MenuItem('slots', 'Slots', submenu_fn=_slots_items),
+            MenuItem('note_accuracy', 'Note Accuracy', submenu_fn=_note_accuracy_items),
         ]
 
     def _theme_items() -> list[MenuItem]:
@@ -111,6 +115,18 @@ def run() -> None:
             MenuItem('theme:light', 'Light', checked=(current == 'light')),
         ]
 
+    # "Note accuracy threshold" for the traditional (sheet music) view --
+    # readability over exact MIDI timing (see midi/quantize.py's
+    # snap_note_span). 0 = exact timing, no snapping.
+    _SNAP_GRID_OPTIONS = [
+        (0, 'Exact Timing'), (16, "1/16 Note"), (32, "1/32 Note (Recommended)"), (64, "1/64 Note"),
+    ]
+
+    def _note_accuracy_items() -> list[MenuItem]:
+        current = user_settings.get('notation', {}).get('snap_grid', quantize.DEFAULT_SNAP_GRID)
+        return [MenuItem(f'snap_grid:{value}', label, checked=(current == value))
+                for value, label in _SNAP_GRID_OPTIONS]
+
     def _slots_items() -> list[MenuItem]:
         entries = [('timeline', 'Timeline'), ('sheet', 'Sheet'),
                    ('keyboard', 'Keyboard'), ('properties', 'Properties')]
@@ -119,7 +135,14 @@ def run() -> None:
 
     menu = MenuBar([
         TopMenu('file', 'File', _file_items, width=200, submenu_width=240),
-        TopMenu('view', 'View', _view_items, width=200, submenu_width=145),
+        # 210 (was 145) -- 145 was sized for Color Theme/Slots' short labels
+        # only; "1/32 Note (Recommended)" (the Note Accuracy submenu's
+        # longest item) needed ~189px including its checkmark, so 145
+        # clipped it. All of the View top-menu's submenus share one width
+        # (Dropdown/TopMenu don't support a per-submenu size), so this
+        # widens Color Theme/Slots too -- harmless, just some empty space
+        # to the right of their short labels.
+        TopMenu('view', 'View', _view_items, width=200, submenu_width=210),
     ], height=MENU_H)
 
     def _cleanup() -> None:
@@ -165,6 +188,12 @@ def run() -> None:
                 user_settings['theme'] = action[len('theme:'):]
                 cfg.save(user_settings)
                 continue
+            if action and action.startswith('snap_grid:'):
+                value = int(action[len('snap_grid:'):])
+                user_settings.setdefault('notation', {})['snap_grid'] = value
+                cfg.save(user_settings)
+                app.set_notation_snap_grid(value)
+                continue
             if action and action.startswith('slot_toggle:'):
                 slot_manager.toggle_visible(action[len('slot_toggle:'):])
                 continue
@@ -194,7 +223,14 @@ def run() -> None:
                     ctrl = bool(pygame.key.get_mods() & pygame.KMOD_CTRL)
                     if event.y != 0:
                         if ctrl:
-                            app.sheet_zoom = max(0.25, min(4.0, app.sheet_zoom * 1.15 ** event.y))
+                            # Max raised from 4.0 -- at MEASURES_VISIBLE=8
+                            # (bars.py/traditional.py), 4.0 only ever got
+                            # down to 2 measures across the full width, not
+                            # enough to make individual notes/stems legible
+                            # in a dense passage. 16.0 gets to half a
+                            # measure -- room to raise further if still not
+                            # tight enough.
+                            app.sheet_zoom = max(0.25, min(16.0, app.sheet_zoom * 1.15 ** event.y))
                         else:
                             app.bars_scroll = max(0.0, min(1.0, app.bars_scroll + 0.08 * (-event.y)))
                     if event.x != 0:

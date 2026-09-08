@@ -1,11 +1,12 @@
-'''Left-panel dashboard — file open/new, playback controls, track list with
-per-track mute. Ported from the old ui/dashboard.py, trimmed to Milestone 3's
-scope: no record-arm panel, no view-mode toggle (traditional notation is
-Milestone 4), no per-track delete (tied to the recording workflow, Milestone
-5). Built on the shared Button widget instead of a copy of it (Plan Part
-3.4); the track dropdown is themed via midivis.render.theme like everything
-else, closing the "Track dropdown bypasses the theme system" bug Plan Part 2
-called out in the old repo.
+'''Left-panel dashboard — file open/new, playback controls, Bars/Traditional
+view toggle, track list with per-track mute. Ported from the old
+ui/dashboard.py, trimmed to Milestone 3's scope originally (no record-arm
+panel, no per-track delete — both tied to the recording workflow, Milestone
+5); the Bars/Traditional toggle was deferred to Milestone 4 (traditional
+notation didn't exist yet) and is added here. Built on the shared Button
+widget instead of a copy of it (Plan Part 3.4); the track dropdown is themed
+via midivis.render.theme like everything else, closing the "Track dropdown
+bypasses the theme system" bug Plan Part 2 called out in the old repo.
 '''
 from __future__ import annotations
 
@@ -248,13 +249,21 @@ class Dashboard:
         self.btn_open = Button((self._BTN_X, y0 + 80, self._BTN_W, self._BTN_H), 'Open File')
         self.btn_play = Button((self._BTN_X, y0 + 164, 100, self._BTN_H), 'Play')
         self.btn_reset = Button((114, y0 + 164, self._RST_W, self._BTN_H), '')
-        self.btn_tracks = Button((self._BTN_X, y0 + 248, self._BTN_W, self._BTN_H), 'Tracks')
+        # Bars/Traditional view toggle -- deferred from Milestone 3 (traditional
+        # notation didn't exist yet) to this milestone.
+        self.btn_bars = Button((self._BTN_X, y0 + 248, self._BTN_W, self._BTN_H), 'Bars')
+        self.btn_traditional = Button((self._BTN_X, y0 + 298, self._BTN_W, self._BTN_H), 'Traditional')
+        self.btn_tracks = Button((self._BTN_X, y0 + 382, self._BTN_W, self._BTN_H), 'Tracks')
 
         self.btn_play.enabled = False
         self.btn_reset.enabled = False
+        self.btn_bars.enabled = False
+        self.btn_traditional.enabled = False
         self.btn_tracks.enabled = False
+        self.btn_bars.selected = True
 
-        self._all_buttons = (self.btn_new, self.btn_open, self.btn_play, self.btn_reset, self.btn_tracks)
+        self._all_buttons = (self.btn_new, self.btn_open, self.btn_play, self.btn_reset,
+                              self.btn_bars, self.btn_traditional, self.btn_tracks)
         self._dropdown = _TrackDropdown(self.btn_tracks.rect, left_w)
 
     # ── Public state queries ────────────────────────────────────────────
@@ -265,6 +274,8 @@ class Dashboard:
     def _enable_file_dependent_buttons(self) -> None:
         self.btn_play.enabled = True
         self.btn_reset.enabled = True
+        self.btn_bars.enabled = True
+        self.btn_traditional.enabled = True
         self.btn_tracks.enabled = True
 
     # ── File operations ─────────────────────────────────────────────────
@@ -334,6 +345,14 @@ class Dashboard:
             app.seek(0.0)
             return True
 
+        if self.btn_bars.clicked(event):
+            app.view = 'bars'
+            return True
+
+        if self.btn_traditional.clicked(event):
+            app.view = 'traditional'
+            return True
+
         if self.btn_tracks.clicked(event):
             if menu:
                 menu.close()
@@ -356,16 +375,20 @@ class Dashboard:
         title = small_font.render('MIDI VIS', True, pal['title'])
         screen.blit(title, (self._lw // 2 - title.get_width() // 2, pt + 6))
 
-        for dy in (154, 238):
+        for dy in (154, 238, 372):
             pygame.draw.line(screen, pal['sep'], (10, pt + dy), (self._lw - 10, pt + dy))
 
         self.btn_play.text = 'Pause' if app.playing else 'Play'
         play_icon = _icon_pause if app.playing else _icon_play
+        self.btn_bars.selected = (app.view == 'bars')
+        self.btn_traditional.selected = (app.view == 'traditional')
 
         self.btn_new.draw(screen, font, pal, _icon_new)
         self.btn_open.draw(screen, font, pal, _icon_open)
         self.btn_play.draw(screen, font, pal, play_icon)
         self.btn_reset.draw(screen, font, pal, _icon_reset)
+        self.btn_bars.draw(screen, font, pal)
+        self.btn_traditional.draw(screen, font, pal)
         self.btn_tracks.draw(screen, font, pal, _icon_tracks)
 
         if app.loaded:
